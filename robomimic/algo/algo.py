@@ -7,25 +7,28 @@ These factory functions are registered into a global dictionary with the
 @register_algo_factory_func function decorator. This makes it easy for
 @algo_factory to instantiate the correct `Algo` subclass.
 """
+
+from __future__ import annotations
+
 import textwrap
-from copy import deepcopy
 from collections import OrderedDict
+from copy import deepcopy
+from typing import TypeVar
 
-import torch.nn as nn
-import torch
-import os
 import numpy as np
-import imageio
+import torch
+import torch.nn as nn
 
-import robomimic.utils.tensor_utils as TensorUtils
-import robomimic.utils.torch_utils as TorchUtils
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.python_utils as PyUtils
-
-from torch.utils.data import DataLoader
+import robomimic.utils.tensor_utils as TensorUtils
+import robomimic.utils.torch_utils as TorchUtils
+from robomimic.config import Config
 
 # mapping from algo name to factory functions that map algo configs to algo class names
 REGISTERED_ALGO_FACTORY_FUNCS = OrderedDict()
+
+T = TypeVar("T", torch.Tensor, np.ndarray)
 
 
 def register_algo_factory_func(algo_name):
@@ -36,8 +39,10 @@ def register_algo_factory_func(algo_name):
     Args:
         algo_name (str): the algorithm name to register the algorithm under
     """
+
     def decorator(factory_func):
         REGISTERED_ALGO_FACTORY_FUNCS[algo_name] = factory_func
+
     return decorator
 
 
@@ -82,7 +87,7 @@ def algo_factory(algo_name, config, obs_key_shapes, ac_dim, device):
         obs_key_shapes=obs_key_shapes,
         ac_dim=ac_dim,
         device=device,
-        **algo_kwargs
+        **algo_kwargs,
     )
 
 
@@ -93,15 +98,16 @@ class Algo(object):
     a standard API to be used by training functions such as @run_epoch in
     utils/train_utils.py.
     """
+
     def __init__(
         self,
-        algo_config,
-        obs_config,
-        global_config,
-        obs_key_shapes,
-        ac_dim,
-        device
-    ):
+        algo_config: Config,
+        obs_config: Config,
+        global_config: Config,
+        obs_key_shapes: OrderedDict,
+        ac_dim: int,
+        device: torch.Device,
+    ) -> None:
         """
         Args:
             algo_config (Config object): instance of Config corresponding to the algo section
@@ -152,11 +158,17 @@ class Algo(object):
         # We check across all modality groups (obs, goal, subgoal), and see if the inputted observation key exists
         # across all modalitie specified in the config. If so, we store its corresponding shape internally
         for k in obs_key_shapes:
-            if "obs" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.obs.values() for obs_key in modality]:
+            if "obs" in self.obs_config.modalities and k in [
+                obs_key for modality in self.obs_config.modalities.obs.values() for obs_key in modality
+            ]:
                 self.obs_shapes[k] = obs_key_shapes[k]
-            if "goal" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.goal.values() for obs_key in modality]:
+            if "goal" in self.obs_config.modalities and k in [
+                obs_key for modality in self.obs_config.modalities.goal.values() for obs_key in modality
+            ]:
                 self.goal_shapes[k] = obs_key_shapes[k]
-            if "subgoal" in self.obs_config.modalities and k in [obs_key for modality in self.obs_config.modalities.subgoal.values() for obs_key in modality]:
+            if "subgoal" in self.obs_config.modalities and k in [
+                obs_key for modality in self.obs_config.modalities.subgoal.values() for obs_key in modality
+            ]:
                 self.subgoal_shapes[k] = obs_key_shapes[k]
 
     def _create_networks(self):
@@ -179,21 +191,29 @@ class Algo(object):
             # only make optimizers for networks that have been created - @optim_params may have more
             # settings for unused networks
             if k in self.nets:
-                self.step_lr_schedulers_every_batch[k] = self.optim_params[k].learning_rate.get("step_every_batch", False)
+                self.step_lr_schedulers_every_batch[k] = self.optim_params[k].learning_rate.get(
+                    "step_every_batch", False
+                )
                 if isinstance(self.nets[k], nn.ModuleList):
                     self.optimizers[k] = [
-                        TorchUtils.optimizer_from_optim_params(net_optim_params=self.optim_params[k], net=self.nets[k][i])
+                        TorchUtils.optimizer_from_optim_params(
+                            net_optim_params=self.optim_params[k], net=self.nets[k][i]
+                        )
                         for i in range(len(self.nets[k]))
                     ]
                     self.lr_schedulers[k] = [
-                        TorchUtils.lr_scheduler_from_optim_params(net_optim_params=self.optim_params[k], net=self.nets[k][i], optimizer=self.optimizers[k][i])
+                        TorchUtils.lr_scheduler_from_optim_params(
+                            net_optim_params=self.optim_params[k], net=self.nets[k][i], optimizer=self.optimizers[k][i]
+                        )
                         for i in range(len(self.nets[k]))
                     ]
                 else:
                     self.optimizers[k] = TorchUtils.optimizer_from_optim_params(
-                        net_optim_params=self.optim_params[k], net=self.nets[k])
+                        net_optim_params=self.optim_params[k], net=self.nets[k]
+                    )
                     self.lr_schedulers[k] = TorchUtils.lr_scheduler_from_optim_params(
-                        net_optim_params=self.optim_params[k], net=self.nets[k], optimizer=self.optimizers[k])
+                        net_optim_params=self.optim_params[k], net=self.nets[k], optimizer=self.optimizers[k]
+                    )
 
     def process_batch_for_training(self, batch):
         """
@@ -206,7 +226,7 @@ class Algo(object):
 
         Returns:
             input_batch (dict): processed and filtered batch that
-                will be used for training 
+                will be used for training
         """
         return batch
 
@@ -222,8 +242,8 @@ class Algo(object):
                 training will occur (after @process_batch_for_training
                 is called)
 
-            obs_normalization_stats (dict or None): if provided, this should map observation 
-                keys to dicts with a "mean" and "std" of shape (1, ...) where ... is the 
+            obs_normalization_stats (dict or None): if provided, this should map observation
+                keys to dicts with a "mean" and "std" of shape (1, ...) where ... is the
                 default shape for the observation.
 
         Returns:
@@ -231,7 +251,9 @@ class Algo(object):
         """
 
         # ensure obs_normalization_stats are torch Tensors on proper device
-        obs_normalization_stats = TensorUtils.to_float(TensorUtils.to_device(TensorUtils.to_tensor(obs_normalization_stats), self.device))
+        obs_normalization_stats = TensorUtils.to_float(
+            TensorUtils.to_device(TensorUtils.to_tensor(obs_normalization_stats), self.device)
+        )
 
         # we will search the nested batch dictionary for the following special batch dict keys
         # and apply the processing function to their values (which correspond to observations)
@@ -280,9 +302,9 @@ class Algo(object):
         Called after each gradient step.
         """
         # LR scheduling updates
-        if hasattr(self, 'step_lr_schedulers_every_batch'):
+        if hasattr(self, "step_lr_schedulers_every_batch"):
             for k, v in self.step_lr_schedulers_every_batch.items():
-                if v and self.lr_schedulers[k] is not None: 
+                if v and self.lr_schedulers[k] is not None:
                     self.lr_schedulers[k].step()
 
     def log_info(self, info):
@@ -311,7 +333,7 @@ class Algo(object):
         """
         # LR scheduling updates
         for k, v in self.step_lr_schedulers_every_batch.items():
-            if not v and self.lr_schedulers[k] is not None: 
+            if not v and self.lr_schedulers[k] is not None:
                 self.lr_schedulers[k].step()
 
     def set_eval(self):
@@ -359,8 +381,7 @@ class Algo(object):
         """
         Pretty print algorithm and network description.
         """
-        return "{} (\n".format(self.__class__.__name__) + \
-               textwrap.indent(self.nets.__repr__(), '  ') + "\n)"
+        return "{} (\n".format(self.__class__.__name__) + textwrap.indent(self.nets.__repr__(), "  ") + "\n)"
 
     def reset(self):
         """
@@ -373,7 +394,12 @@ class PolicyAlgo(Algo):
     """
     Base class for all algorithms that can be used as policies.
     """
-    def get_action(self, obs_dict, goal_dict=None):
+
+    def get_action(
+        self,
+        obs_dict: dict[str, torch.Tensor],
+        goal_dict: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """
         Get policy action outputs.
 
@@ -385,12 +411,13 @@ class PolicyAlgo(Algo):
             action (torch.Tensor): action tensor
         """
         raise NotImplementedError
-    
+
 
 class ValueAlgo(Algo):
     """
     Base class for all algorithms that can learn a value function.
     """
+
     def get_state_value(self, obs_dict, goal_dict=None):
         """
         Get state value outputs.
@@ -424,6 +451,7 @@ class PlannerAlgo(Algo):
     Base class for all algorithms that can be used for planning subgoals
     conditioned on current observations and potential goal observations.
     """
+
     def get_subgoal_predictions(self, obs_dict, goal_dict=None):
         """
         Get predicted subgoal outputs.
@@ -456,6 +484,7 @@ class HierarchicalAlgo(Algo):
     Base class for all hierarchical algorithms that consist of (1) subgoal planning
     and (2) subgoal-conditioned policy learning.
     """
+
     def get_action(self, obs_dict, goal_dict=None):
         """
         Get policy action outputs.
@@ -497,7 +526,14 @@ class RolloutPolicy(object):
     """
     Wraps @Algo object to make it easy to run policies in a rollout loop.
     """
-    def __init__(self, policy, obs_normalization_stats=None, action_normalization_stats=None):
+
+    def __init__(
+        self,
+        policy: PolicyAlgo,
+        obs_normalization_stats: dict[str, dict[str, T]] | None = None,
+        action_normalization_stats: dict[str, dict[str, T]] | None = None,
+        use_torch: bool = False,
+    ):
         """
         Args:
             policy (Algo instance): @Algo object to wrap to prepare for rollouts
@@ -510,6 +546,15 @@ class RolloutPolicy(object):
         self.policy = policy
         self.obs_normalization_stats = obs_normalization_stats
         self.action_normalization_stats = action_normalization_stats
+        self.use_torch = use_torch
+        if use_torch and self.obs_normalization_stats is not None:
+            self.obs_normalization_stats = TensorUtils.to_device(
+                TensorUtils.to_tensor(self.obs_normalization_stats), self.policy.device
+            )
+        if use_torch and self.action_normalization_stats is not None:
+            self.action_normalization_stats = TensorUtils.to_device(
+                TensorUtils.to_tensor(self.action_normalization_stats), self.policy.device
+            )
 
     def start_episode(self):
         """
@@ -518,12 +563,17 @@ class RolloutPolicy(object):
         self.policy.set_eval()
         self.policy.reset()
 
-    def _prepare_observation(self, ob, batched_ob=False, postprocess_visual_obs=True):
+    def _prepare_observation(
+        self,
+        ob: dict[str, T],
+        batched_ob: bool = False,
+        postprocess_visual_obs: bool = True,
+    ) -> dict[str, torch.Tensor]:
         """
         Prepare raw observation dict from environment for policy.
 
         Args:
-            ob (dict): single observation dictionary from environment (no batch dimension, 
+            ob (dict): single observation dictionary from environment (no batch dimension,
                 and np.array values for each key)
 
             batched_ob (bool): whether the input is already batched
@@ -538,28 +588,33 @@ class RolloutPolicy(object):
         ob = TensorUtils.to_float(ob)
         if self.obs_normalization_stats is not None:
             # ensure obs_normalization_stats are torch Tensors on proper device
-            obs_normalization_stats = TensorUtils.to_float(TensorUtils.to_device(TensorUtils.to_tensor(self.obs_normalization_stats), self.policy.device))
+            obs_normalization_stats = TensorUtils.to_float(
+                TensorUtils.to_device(
+                    TensorUtils.to_tensor(self.obs_normalization_stats),
+                    self.policy.device,
+                )
+            )
             # limit normalization to obs keys being used, in case environment includes extra keys
-            ob = { k : ob[k] for k in self.policy.global_config.all_obs_keys }
+            ob = {k: ob[k] for k in self.policy.global_config.all_obs_keys}
             ob = ObsUtils.normalize_dict(ob, normalization_stats=obs_normalization_stats)
         # postprocess visual observations
         if postprocess_visual_obs:
             for k in ob:
-                if ObsUtils.key_is_obs_modality(key=k, obs_modality="rgb") or ObsUtils.key_is_obs_modality(key=k, obs_modality="depth"):
+                if ObsUtils.key_is_obs_modality(k, "rgb") or ObsUtils.key_is_obs_modality(k, "depth"):
                     ob[k] = ObsUtils.process_obs(obs=ob[k], obs_key=k)
         return ob
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         """Pretty print network description"""
         return self.policy.__repr__()
 
-    def __call__(self, ob, goal=None, batched_ob=False):
+    def __call__(self, ob: dict[str, T], goal: dict | None = None, batched_ob: bool = False) -> T:
         """
         Produce action from raw observation dict (and maybe goal dict) from environment.
 
         Args:
-            ob (dict): single observation dictionary from environment (no batch dimension, 
-                and np.array values for each key)
+            ob (dict): single observation dictionary from environment (no batch dimension,
+                and np.array or torch.Tensor values for each key)
             goal (dict): goal observation
             batched_ob (bool): whether the input is already batched
         """
@@ -568,11 +623,14 @@ class RolloutPolicy(object):
             goal = self._prepare_observation(goal, batched_ob=batched_ob)
         ac = self.policy.get_action(obs_dict=ob, goal_dict=goal)
         if not batched_ob:
-            ac = ac[0]
-        ac = TensorUtils.to_numpy(ac)
+            ac: T = ac[0]
+        if not self.use_torch:
+            ac = TensorUtils.to_numpy(ac)
         if self.action_normalization_stats is not None:
-            action_keys = self.policy.global_config.train.action_keys
-            action_shapes = {k: self.action_normalization_stats[k]["offset"].shape[1:] for k in self.action_normalization_stats}
+            action_keys: list[str] = self.policy.global_config.train.action_keys
+            action_shapes = {
+                k: self.action_normalization_stats[k]["offset"].shape[1:] for k in self.action_normalization_stats
+            }
             ac_dict = PyUtils.vector_to_action_dict(ac, action_shapes=action_shapes, action_keys=action_keys)
             ac_dict = ObsUtils.unnormalize_dict(ac_dict, normalization_stats=self.action_normalization_stats)
             action_config = self.policy.global_config.train.action_config

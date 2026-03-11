@@ -1,46 +1,49 @@
 """
-This file contains several utility functions used to define the main training loop. It 
+This file contains several utility functions used to define the main training loop. It
 mainly consists of functions to assist with logging, rollouts, and the @run_epoch function,
 which is the core training logic for models in this repository.
 """
-import os
-import time
+
+from __future__ import annotations
+
 import datetime
-import shutil
 import json
-import h5py
+import math
+import os
+import shutil
+import time
+from collections import OrderedDict
+from copy import deepcopy
+
 import imageio
 import numpy as np
-from copy import deepcopy
-from collections import OrderedDict
-
 import torch
 
 import robomimic
-import robomimic.utils.tensor_utils as TensorUtils
-import robomimic.utils.log_utils as LogUtils
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.lang_utils as LangUtils
-
-from robomimic.utils.dataset import SequenceDataset, MetaDataset
-from robomimic.envs.env_base import EnvBase
-from robomimic.envs.wrappers import EnvWrapper
+import robomimic.utils.log_utils as LogUtils
+import robomimic.utils.tensor_utils as TensorUtils
 from robomimic.algo import RolloutPolicy
+from robomimic.envs.env_base import EnvBase
+from robomimic.envs.env_isaaclab import EnvIsaacLab
+from robomimic.envs.wrappers import EnvWrapper
+from robomimic.utils.dataset import MetaDataset, SequenceDataset
 
 
 def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
     """
     Create experiment directory from config. If an identical experiment directory
-    exists and @auto_remove_exp_dir is False (default), the function will prompt 
+    exists and @auto_remove_exp_dir is False (default), the function will prompt
     the user on whether to remove and replace it, or keep the existing one and
     add a new subdirectory with the new timestamp for the current run.
 
     Args:
         auto_remove_exp_dir (bool): if True, automatically remove the existing experiment
             folder if it exists at the same path.
-        resume (bool): if True, resume an existing training run instead of creating a 
+        resume (bool): if True, resume an existing training run instead of creating a
             new experiment directory
-    
+
     Returns:
         log_dir (str): path to created log directory (sub-folder in experiment directory)
         output_dir (str): path to created models directory (sub-folder in experiment directory)
@@ -50,7 +53,7 @@ def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
     """
     # timestamp for directory names
     t_now = time.time()
-    time_str = datetime.datetime.fromtimestamp(t_now).strftime('%Y%m%d%H%M%S')
+    time_str = datetime.datetime.fromtimestamp(t_now).strftime("%Y%m%d%H%M%S")
 
     # create directory for where to dump model parameters, tensorboard logs, and videos
     base_output_dir = os.path.expanduser(config.train.output_dir)
@@ -59,10 +62,14 @@ def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
         base_output_dir = os.path.join(robomimic.__path__[0], base_output_dir)
     base_output_dir = os.path.join(base_output_dir, config.experiment.name)
     if resume:
-        assert os.path.exists(base_output_dir), "Resuming training run, but output dir {} does not exist".format(base_output_dir)
+        assert os.path.exists(base_output_dir), "Resuming training run, but output dir {} does not exist".format(
+            base_output_dir
+        )
         subdir_lst = os.listdir(base_output_dir)
         time_str = sorted(subdir_lst)[-1]  # get the most recent subdirectory
-        assert os.path.isdir(os.path.join(base_output_dir, time_str)), "Found item {} that is not a subdirectory in {}".format(time_str, base_output_dir)
+        assert os.path.isdir(os.path.join(base_output_dir, time_str)), (
+            "Found item {} that is not a subdirectory in {}".format(time_str, base_output_dir)
+        )
     elif os.path.exists(base_output_dir):
         if not auto_remove_exp_dir:
             ans = input("WARNING: model directory ({}) already exists! \noverwrite? (y/n)\n".format(base_output_dir))
@@ -87,7 +94,7 @@ def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
     os.makedirs(video_dir, exist_ok=resume)
 
     time_dir = os.path.join(base_output_dir, time_str)
-    
+
     return log_dir, output_dir, video_dir, time_dir
 
 
@@ -109,15 +116,22 @@ def load_data_for_training(config, obs_keys):
     train_filter_by_attribute = config.train.hdf5_filter_key
     valid_filter_by_attribute = config.train.hdf5_validation_filter_key
     if valid_filter_by_attribute is not None:
-        assert config.experiment.validate, "specified validation filter key {}, but config.experiment.validate is not set".format(valid_filter_by_attribute)
+        assert config.experiment.validate, (
+            "specified validation filter key {}, but config.experiment.validate is not set".format(
+                valid_filter_by_attribute
+            )
+        )
 
     # load the dataset into memory
     if config.experiment.validate:
         # assert not config.train.hdf5_normalize_obs, "no support for observation normalization with validation data yet"
-        assert (train_filter_by_attribute is not None) and (valid_filter_by_attribute is not None), \
-            "did not specify filter keys corresponding to train and valid split in dataset" \
+        assert (train_filter_by_attribute is not None) and (valid_filter_by_attribute is not None), (
+            "did not specify filter keys corresponding to train and valid split in dataset"
             " - please fill config.train.hdf5_filter_key and config.train.hdf5_validation_filter_key"
-        assert isinstance(config.train.data, list), "config.train.data should be a list of datasets, not a single dataset"
+        )
+        assert isinstance(config.train.data, list), (
+            "config.train.data should be a list of datasets, not a single dataset"
+        )
         for dataset_cfg in config.train.data:
             train_demo_keys = FileUtils.get_demos_for_filter_key(
                 hdf5_path=os.path.expanduser(dataset_cfg["path"]),
@@ -127,8 +141,9 @@ def load_data_for_training(config, obs_keys):
                 hdf5_path=os.path.expanduser(dataset_cfg["path"]),
                 filter_key=valid_filter_by_attribute,
             )
-            assert set(train_demo_keys).isdisjoint(set(valid_demo_keys)), "training demonstrations overlap with " \
-                "validation demonstrations!"
+            assert set(train_demo_keys).isdisjoint(set(valid_demo_keys)), (
+                "training demonstrations overlap with validation demonstrations!"
+            )
         train_dataset = dataset_factory(config, obs_keys, filter_by_attribute=train_filter_by_attribute)
         valid_dataset = dataset_factory(config, obs_keys, filter_by_attribute=valid_filter_by_attribute)
     else:
@@ -174,7 +189,7 @@ def dataset_factory(config, obs_keys, filter_by_attribute=None, dataset_path=Non
         action_keys=config.train.action_keys,
         dataset_keys=config.train.dataset_keys,
         action_config=config.train.action_config,
-        load_next_obs=config.train.hdf5_load_next_obs, # whether to load next observations (s') from dataset
+        load_next_obs=config.train.hdf5_load_next_obs,  # whether to load next observations (s') from dataset
         frame_stack=config.train.frame_stack,
         seq_length=config.train.seq_length,
         pad_frame_stack=config.train.pad_frame_stack,
@@ -227,13 +242,12 @@ def get_dataset(
         normalize_weights_by_ds_size (bool): if True, normalize dataset weights by the size of each dataset
         meta_ds_class (class): class of the meta dataset to create (e.g. MetaDataset)
         meta_ds_kwargs (dict): keyword arguments to pass to the meta dataset class constructor
-    
+
     Returns:
         ds (SequenceDataset or MetaDataset instance): dataset object created from the provided class and parameters
     """
     ds_list = []
     for i in range(len(ds_weights)):
-        
         ds_kwargs_copy = deepcopy(ds_kwargs)
 
         keys = ["hdf5_path", "filter_by_attribute", "demo_limit"]
@@ -242,9 +256,9 @@ def get_dataset(
             ds_kwargs_copy[k] = ds_kwargs[k][i]
 
         ds_kwargs_copy["lang"] = ds_langs[i]
-        
+
         ds_list.append(ds_class(**ds_kwargs_copy))
-    
+
     if len(ds_weights) == 1:
         ds = ds_list[0]
     else:
@@ -254,7 +268,7 @@ def get_dataset(
             datasets=ds_list,
             ds_weights=ds_weights,
             normalize_weights_by_ds_size=normalize_weights_by_ds_size,
-            **meta_ds_kwargs
+            **meta_ds_kwargs,
         )
 
     return ds
@@ -265,23 +279,21 @@ def batchify_obs(obs_list):
     Converts a list of observation dictionaries into a single dictionary.
     """
     keys = list(obs_list[0].keys())
-    obs = {
-        k: np.stack([obs_list[i][k] for i in range(len(obs_list))]) for k in keys
-    }
-    
+    obs = {k: np.stack([obs_list[i][k] for i in range(len(obs_list))]) for k in keys}
+
     return obs
 
 
 def run_rollout(
-        policy, 
-        env, 
-        horizon,
-        use_goals=False,
-        render=False,
-        video_writer=None,
-        video_skip=5,
-        terminate_on_success=False,
-    ):
+    policy: RolloutPolicy,
+    env: EnvBase,
+    horizon: int,
+    use_goals: bool = False,
+    render: bool = False,
+    video_writer: imageio.Writer | None = None,
+    video_skip: int = 5,
+    terminate_on_success: bool = False,
+):
     """
     Runs a rollout in an environment with the current network parameters.
 
@@ -296,7 +308,7 @@ def run_rollout(
 
         render (bool): if True, render the rollout to the screen
 
-        video_writer (imageio Writer instance): if not None, use video writer object to append frames at 
+        video_writer (imageio Writer instance): if not None, use video writer object to append frames at
             rate given by @video_skip
 
         video_skip (int): how often to write video frame
@@ -309,11 +321,14 @@ def run_rollout(
     assert isinstance(policy, RolloutPolicy)
     assert isinstance(env, EnvBase) or isinstance(env, EnvWrapper)
 
+    parallelize_envs = isinstance(env, EnvIsaacLab)
+
     policy.start_episode()
 
     ob_dict = env.reset()
     goal_dict = None
     if use_goals:
+        assert not parallelize_envs, "goals currently unsupported for parallel environments"
         # retrieve goal from the environment
         goal_dict = env.get_goal()
 
@@ -321,17 +336,16 @@ def run_rollout(
     video_count = 0  # video frame counter
 
     rews = []
-    success = None # success metrics
-
-    end_step = None
-
+    dones = []
+    success = None  # success metrics
+    end_step: int | None = None
     video_frames = []
-    
+
     try:
         for step_i in range(horizon):
             # get action from policy
             policy_ob = ob_dict
-            ac = policy(ob=policy_ob, goal=goal_dict)
+            ac = policy(ob=policy_ob, goal=goal_dict, batched_ob=parallelize_envs)
 
             # play action
             ob_dict, r, done, _ = env.step(ac)
@@ -342,6 +356,7 @@ def run_rollout(
 
             # compute reward
             rews.append(r)
+            dones.append(done)
 
             cur_success_metrics = env.is_success()
 
@@ -360,21 +375,30 @@ def run_rollout(
                 video_count += 1
 
             # break if done
-            if done or (terminate_on_success and success["task"]):
+            all_done = done if not parallelize_envs else bool(torch.all(done).item())
+            if all_done or (terminate_on_success and success["task"]):
                 end_step = step_i
                 break
 
     except env.rollout_exceptions as e:
-        print("WARNING: got rollout exception {}".format(e))
-
+        print(f"WARNING: got rollout exception {e}")
 
     if video_writer is not None:
         for frame in video_frames:
             video_writer.append_data(frame)
 
-    end_step = end_step or step_i
-    total_reward = np.sum(rews[:end_step + 1])
-    
+    if parallelize_envs:
+        rews_tens = torch.stack(rews, dim=1)  # num_envs x time
+        dones_tens = torch.stack(dones, dim=1)  # num_envs x time
+        dones_tens[:, -1] = 1  # set last idx to done
+        done_mask = ~(dones_tens.cumsum(dim=1) >= 1)
+        # mask out rewards after episode end
+        total_reward = torch.sum(rews_tens * done_mask, dim=1).tolist()
+        end_step = torch.mean(dones_tens.argmax(dim=1).float()).item()
+    else:
+        end_step = end_step or step_i
+        total_reward = np.sum(rews[: end_step + 1])
+
     results["Return"] = total_reward
     results["Horizon"] = end_step + 1
     results["Success_Rate"] = float(success["task"])
@@ -388,19 +412,19 @@ def run_rollout(
 
 
 def rollout_with_stats(
-        policy,
-        envs,
-        horizon,
-        use_goals=False,
-        num_episodes=None,
-        render=False,
-        video_dir=None,
-        video_path=None,
-        epoch=None,
-        video_skip=5,
-        terminate_on_success=False,
-        verbose=False,
-    ):
+    policy: RolloutPolicy,
+    envs: dict[str, EnvBase],
+    horizon: int,
+    use_goals: bool = False,
+    num_episodes: int | None = None,
+    render: bool = False,
+    video_dir: str | None = None,
+    video_path: str | None = None,
+    epoch: int | None = None,
+    video_skip: int | None = 5,
+    terminate_on_success: bool = False,
+    verbose: bool = False,
+) -> tuple[dict, dict[str, str]]:
     """
     A helper function used in the train loop to conduct evaluation rollouts per environment
     and summarize the results.
@@ -433,10 +457,10 @@ def rollout_with_stats(
         terminate_on_success (bool): if True, terminate episode early as soon as a success is encountered
 
         verbose (bool): if True, print results of each rollout
-    
+
     Returns:
-        all_rollout_logs (dict): dictionary of rollout statistics (e.g. return, success rate, ...) 
-            averaged across all rollouts 
+        all_rollout_logs (dict): dictionary of rollout statistics (e.g. return, success rate, ...)
+            averaged across all rollouts
 
         video_paths (dict): path to rollout videos for each environment
     """
@@ -451,14 +475,14 @@ def rollout_with_stats(
     video_writers = OrderedDict()
     if video_path is not None:
         # a single video is written for all envs
-        video_paths = { k : video_path for k in envs }
+        video_paths = {k: video_path for k in envs}
         video_writer = imageio.get_writer(video_path, fps=20)
-        video_writers = { k : video_writer for k in envs }
+        video_writers = {k: video_writer for k in envs}
     if video_dir is not None:
         # video is written per env
-        video_str = "_epoch_{}.mp4".format(epoch) if epoch is not None else ".mp4" 
-        video_paths = { k : os.path.join(video_dir, "{}{}".format(k, video_str)) for k in envs }
-        video_writers = { k : imageio.get_writer(video_paths[k], fps=20) for k in envs }
+        video_str = "_epoch_{}.mp4".format(epoch) if epoch is not None else ".mp4"
+        video_paths = {k: os.path.join(video_dir, "{}{}".format(k, video_str)) for k in envs}
+        video_writers = {k: imageio.get_writer(video_paths[k], fps=20) for k in envs}
 
     for env_key, env in envs.items():
         env_video_writer = None
@@ -468,10 +492,11 @@ def rollout_with_stats(
 
         env_name = env.name
 
-        print("rollout: env={}, horizon={}, use_goals={}, num_episodes={}".format(
-            env_name, horizon, use_goals, num_episodes,
-        ))
+        print(f"rollout: env={env_name}, horizon={horizon}, use_goals={use_goals}, num_episodes={num_episodes}")
         rollout_logs = []
+        # parallelize rollouts for Isaac envs
+        if isinstance(env, EnvIsaacLab):
+            num_episodes = math.ceil(num_episodes / env.unwrapped.num_envs)
         iterator = range(num_episodes)
         if not verbose:
             iterator = LogUtils.custom_tqdm(iterator, total=num_episodes)
@@ -493,9 +518,9 @@ def rollout_with_stats(
 
             rollout_logs.append(rollout_info)
             num_success += rollout_info["Success_Rate"]
-            
+
             if verbose:
-                print("Episode {}, horizon={}, num_success={}".format(ep_i + 1, horizon, num_success))
+                print(f"Episode {ep_i + 1}, horizon={horizon}, num_success={num_success}")
                 print(json.dumps(rollout_info, sort_keys=True, indent=4))
 
         if video_dir is not None:
@@ -505,7 +530,7 @@ def rollout_with_stats(
         # average metric across all episodes
         rollout_logs = dict((k, [rollout_logs[i][k] for i in range(len(rollout_logs))]) for k in rollout_logs[0])
         rollout_logs_mean = dict((k, np.mean(v)) for k, v in rollout_logs.items())
-        rollout_logs_mean["Time_Episode"] = np.sum(rollout_logs["time"]) / 60. # total time taken for rollouts in minutes
+        rollout_logs_mean["Time_Episode"] = np.sum(rollout_logs["time"]) / 60.0  # total time for rollouts in minutes
         all_rollout_logs[env_key] = rollout_logs_mean
 
     if video_path is not None:
@@ -516,13 +541,13 @@ def rollout_with_stats(
 
 
 def should_save_from_rollout_logs(
-        all_rollout_logs,
-        best_return,
-        best_success_rate,
-        epoch_ckpt_name,
-        save_on_best_rollout_return,
-        save_on_best_rollout_success_rate,
-    ):
+    all_rollout_logs,
+    best_return,
+    best_success_rate,
+    epoch_ckpt_name,
+    save_on_best_rollout_return,
+    save_on_best_rollout_success_rate,
+):
     """
     Helper function used during training to determine whether checkpoints and videos
     should be saved. It will modify input attributes appropriately (such as updating
@@ -542,10 +567,10 @@ def should_save_from_rollout_logs(
         epoch_ckpt_name (str): what to name the checkpoint file - this name might be modified
             by this function
 
-        save_on_best_rollout_return (bool): if True, should save checkpoints that achieve a 
+        save_on_best_rollout_return (bool): if True, should save checkpoints that achieve a
             new best rollout return
 
-        save_on_best_rollout_success_rate (bool): if True, should save checkpoints that achieve a 
+        save_on_best_rollout_success_rate (bool): if True, should save checkpoints that achieve a
             new best rollout success rate
 
     Returns:
@@ -585,7 +610,16 @@ def should_save_from_rollout_logs(
     )
 
 
-def save_model(model, config, env_meta, shape_meta, ckpt_path, variable_state=None, obs_normalization_stats=None, action_normalization_stats=None):
+def save_model(
+    model,
+    config,
+    env_meta,
+    shape_meta,
+    ckpt_path,
+    variable_state=None,
+    obs_normalization_stats=None,
+    action_normalization_stats=None,
+):
     """
     Save model to a torch pth file.
 
@@ -673,7 +707,6 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_nor
 
     data_loader_iter = iter(data_loader)
     for _ in LogUtils.custom_tqdm(range(num_steps)):
-
         # load next batch from data loader
         try:
             t = time.time()
@@ -715,17 +748,17 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_nor
     # add in timing stats
     for k in timing_stats:
         # sum across all training steps, and convert from seconds to minutes
-        step_log_all["Time_{}".format(k)] = np.sum(timing_stats[k]) / 60.
-    step_log_all["Time_Epoch"] = (time.time() - epoch_timestamp) / 60.
+        step_log_all["Time_{}".format(k)] = np.sum(timing_stats[k]) / 60.0
+    step_log_all["Time_Epoch"] = (time.time() - epoch_timestamp) / 60.0
 
     return step_log_all
 
 
 def is_every_n_steps(interval, current_step, skip_zero=False):
     """
-    Convenient function to check whether current_step is at the interval. 
+    Convenient function to check whether current_step is at the interval.
     Returns True if current_step % interval == 0 and asserts a few corner cases (e.g., interval <= 0)
-    
+
     Args:
         interval (int): target interval
         current_step (int): current step

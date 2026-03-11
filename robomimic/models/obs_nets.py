@@ -1,38 +1,35 @@
 """
 Contains torch Modules that help deal with inputs consisting of multiple
-modalities. This is extremely common when networks must deal with one or 
+modalities. This is extremely common when networks must deal with one or
 more observation dictionaries, where each input dictionary can have
 observation keys of a certain modality and shape.
 
 As an example, an observation could consist of a flat "robot0_eef_pos" observation key,
 and a 3-channel RGB "agentview_image" observation key.
 """
-import sys
-import numpy as np
-import textwrap
-from copy import deepcopy
-from collections import OrderedDict
 
+import textwrap
+from collections import OrderedDict
+from copy import deepcopy
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributions as D
 
-from robomimic.utils.python_utils import extract_class_init_kwargs_from_dict
-import robomimic.utils.tensor_utils as TensorUtils
-import robomimic.utils.obs_utils as ObsUtils
 import robomimic.utils.lang_utils as LangUtils
-from robomimic.models.base_nets import Module, Sequential, MLP, RNN_Base, ResNet18Conv, SpatialSoftmax, \
-    FeatureAggregator
-from robomimic.models.obs_core import VisualCore, Randomizer, VisualCoreLanguageConditioned
-from robomimic.models.transformers import PositionalEncoding, GPT_Backbone
+import robomimic.utils.obs_utils as ObsUtils
+import robomimic.utils.tensor_utils as TensorUtils
+from robomimic.models.base_nets import MLP, Module, RNN_Base, Sequential
+from robomimic.models.obs_core import Randomizer, VisualCoreLanguageConditioned
+from robomimic.models.transformers import GPT_Backbone, PositionalEncoding
+from robomimic.utils.python_utils import extract_class_init_kwargs_from_dict
 
 
 def obs_encoder_factory(
-        obs_shapes,
-        feature_activation=nn.ReLU,
-        encoder_kwargs=None,
-    ):
+    obs_shapes: OrderedDict[str, tuple[int, ...]],
+    feature_activation: type[nn.Module] | None = nn.ReLU,
+    encoder_kwargs: dict | None = None,
+):
     """
     Utility function to create an @ObservationEncoder from kwargs specified in config.
 
@@ -63,9 +60,12 @@ def obs_encoder_factory(
     enc = ObservationEncoder(feature_activation=feature_activation)
     for k, obs_shape in obs_shapes.items():
         obs_modality = ObsUtils.OBS_KEYS_TO_MODALITIES[k]
-        enc_kwargs = deepcopy(ObsUtils.DEFAULT_ENCODER_KWARGS[obs_modality]) if encoder_kwargs is None else \
-            deepcopy(encoder_kwargs[obs_modality])
-            
+        enc_kwargs = (
+            deepcopy(ObsUtils.DEFAULT_ENCODER_KWARGS[obs_modality])
+            if encoder_kwargs is None
+            else deepcopy(encoder_kwargs[obs_modality])
+        )
+
         # Sanity check for kwargs in case they don't exist / are None
         if enc_kwargs.get("core_kwargs", None) is None:
             enc_kwargs["core_kwargs"] = {}
@@ -91,7 +91,7 @@ def obs_encoder_factory(
             obs_randomizer_kwargs_list = [obs_randomizer_kwargs_list]
 
         rand_input_shape = obs_shape
-        for rand_class, rand_kwargs in zip(obs_randomizer_class_list, obs_randomizer_kwargs_list):            
+        for rand_class, rand_kwargs in zip(obs_randomizer_class_list, obs_randomizer_kwargs_list):
             rand = None
             if rand_class is not None:
                 rand_kwargs["input_shape"] = rand_input_shape
@@ -121,13 +121,14 @@ class ObservationEncoder(Module):
     Module that processes inputs by observation key and then concatenates the processed
     observation keys together. Each key is processed with an encoder head network.
     Call @register_obs_key to register observation keys with the encoder and then
-    finally call @make to create the encoder networks. 
+    finally call @make to create the encoder networks.
     """
+
     def __init__(self, feature_activation=nn.ReLU):
         """
         Args:
             feature_activation: non-linearity to apply after each obs net - defaults to ReLU. Pass
-                None to apply no activation. 
+                None to apply no activation.
         """
         super(ObservationEncoder, self).__init__()
         self.obs_shapes = OrderedDict()
@@ -140,14 +141,14 @@ class ObservationEncoder(Module):
         self._locked = False
 
     def register_obs_key(
-        self, 
-        name,
-        shape, 
-        net_class=None, 
-        net_kwargs=None, 
-        net=None, 
-        randomizers=None,
-        share_net_from=None,
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        net_class: str | None = None,
+        net_kwargs: dict | None = None,
+        net: nn.Module | None = None,
+        randomizers: nn.Module | list[nn.Module] | None = None,
+        share_net_from: str | None = None,
     ):
         """
         Register an observation key that this encoder should be responsible for.
@@ -163,7 +164,7 @@ class ObservationEncoder(Module):
                 instead of creating a different net
             randomizer (Randomizer instance): if provided, use this Module to augment observation keys
                 coming in to the encoder, and possibly augment the processed output as well
-            share_net_from (str): if provided, use the same instance of @net_class 
+            share_net_from (str): if provided, use the same instance of @net_class
                 as another observation key. This observation key must already exist in this encoder.
                 Warning: Note that this does not share the observation key randomizer
         """
@@ -172,8 +173,9 @@ class ObservationEncoder(Module):
 
         if net is not None:
             assert isinstance(net, Module), "ObservationEncoder: @net must be instance of Module class"
-            assert (net_class is None) and (net_kwargs is None) and (share_net_from is None), \
+            assert (net_class is None) and (net_kwargs is None) and (share_net_from is None), (
                 "ObservationEncoder: @net provided - ignore other net creation options"
+            )
 
         if share_net_from is not None:
             # share processing with another modality
@@ -181,8 +183,8 @@ class ObservationEncoder(Module):
             assert share_net_from in self.obs_shapes
 
         net_kwargs = deepcopy(net_kwargs) if net_kwargs is not None else {}
-        randomizers = [] if randomizers is None else randomizers # handles None
-        if not isinstance(randomizers, list): # handle single randomizer
+        randomizers = [] if randomizers is None else randomizers  # handles None
+        if not isinstance(randomizers, list):  # handle single randomizer
             randomizers = [randomizers]
         rand_output_shape = shape
         for rand in randomizers:
@@ -247,7 +249,7 @@ class ObservationEncoder(Module):
 
         # whether language features should be included in network features
         include_lang_feat = True
-        if (len(rgb_inds_need_lang_cond) > 0):
+        if len(rgb_inds_need_lang_cond) > 0:
             include_lang_feat = False
         return rgb_inds, rgb_inds_need_lang_cond, lang_inds, lang_keys, include_lang_feat
 
@@ -270,8 +272,10 @@ class ObservationEncoder(Module):
         assert self._locked, "ObservationEncoder: @make has not been called yet"
 
         # ensure all modalities that the encoder handles are present
-        assert set(self.obs_shapes.keys()).issubset(obs_dict), "ObservationEncoder: {} does not contain all modalities {}".format(
-            list(obs_dict.keys()), list(self.obs_shapes.keys())
+        assert set(self.obs_shapes.keys()).issubset(obs_dict), (
+            "ObservationEncoder: {} does not contain all modalities {}".format(
+                list(obs_dict.keys()), list(self.obs_shapes.keys())
+            )
         )
 
         rgb_inds, rgb_inds_need_lang_cond, lang_inds, lang_keys, include_lang_feat = self._get_vis_lang_info()
@@ -289,7 +293,7 @@ class ObservationEncoder(Module):
                     x = rand.forward_in(x)
             # maybe process with obs net
             if self.obs_nets[k] is not None:
-                if (ind in rgb_inds_need_lang_cond):
+                if ind in rgb_inds_need_lang_cond:
                     x = self.obs_nets[k](x, lang_emb=obs_dict[lang_keys[0]])
                 else:
                     x = self.obs_nets[k](x)
@@ -314,7 +318,7 @@ class ObservationEncoder(Module):
 
         # might need to omit language embedding from feature size
         rgb_inds, rgb_inds_need_lang_cond, lang_inds, lang_keys, include_lang_feat = self._get_vis_lang_info()
-        skip_lang_dim = (not include_lang_feat)
+        skip_lang_dim = not include_lang_feat
 
         for k in self.obs_shapes:
             feat_shape = self.obs_shapes[k]
@@ -334,19 +338,19 @@ class ObservationEncoder(Module):
         """
         Pretty print the encoder.
         """
-        header = '{}'.format(str(self.__class__.__name__))
-        msg = ''
+        header = "{}".format(str(self.__class__.__name__))
+        msg = ""
         for k in self.obs_shapes:
-            msg += textwrap.indent('\nKey(\n', ' ' * 4)
-            indent = ' ' * 8
+            msg += textwrap.indent("\nKey(\n", " " * 4)
+            indent = " " * 8
             msg += textwrap.indent("name={}\nshape={}\n".format(k, self.obs_shapes[k]), indent)
             msg += textwrap.indent("modality={}\n".format(ObsUtils.OBS_KEYS_TO_MODALITIES[k]), indent)
             msg += textwrap.indent("randomizer={}\n".format(self.obs_randomizers[k]), indent)
             msg += textwrap.indent("net={}\n".format(self.obs_nets[k]), indent)
             msg += textwrap.indent("sharing_from={}\n".format(self.obs_share_mods[k]), indent)
-            msg += textwrap.indent(")", ' ' * 4)
-        msg += textwrap.indent("\noutput_shape={}".format(self.output_shape()), ' ' * 4)
-        msg = header + '(' + msg + '\n)'
+            msg += textwrap.indent(")", " " * 4)
+        msg += textwrap.indent("\noutput_shape={}".format(self.output_shape()), " " * 4)
+        msg = header + "(" + msg + "\n)"
         return msg
 
 
@@ -358,6 +362,7 @@ class ObservationDecoder(Module):
     module in order to implement more complex schemes for generating each
     modality.
     """
+
     def __init__(
         self,
         decode_shapes,
@@ -396,7 +401,7 @@ class ObservationDecoder(Module):
         Returns output shape for this module, which is a dictionary instead
         of a list since outputs are dictionaries.
         """
-        return { k : list(self.obs_shapes[k]) for k in self.obs_shapes }
+        return {k: list(self.obs_shapes[k]) for k in self.obs_shapes}
 
     def forward(self, feats):
         """
@@ -410,16 +415,16 @@ class ObservationDecoder(Module):
 
     def __repr__(self):
         """Pretty print network."""
-        header = '{}'.format(str(self.__class__.__name__))
-        msg = ''
+        header = "{}".format(str(self.__class__.__name__))
+        msg = ""
         for k in self.obs_shapes:
-            msg += textwrap.indent('\nKey(\n', ' ' * 4)
-            indent = ' ' * 8
+            msg += textwrap.indent("\nKey(\n", " " * 4)
+            indent = " " * 8
             msg += textwrap.indent("name={}\nshape={}\n".format(k, self.obs_shapes[k]), indent)
             msg += textwrap.indent("modality={}\n".format(ObsUtils.OBS_KEYS_TO_MODALITIES[k]), indent)
             msg += textwrap.indent("net=({})\n".format(self.nets[k]), indent)
-            msg += textwrap.indent(")", ' ' * 4)
-        msg = header + '(' + msg + '\n)'
+            msg += textwrap.indent(")", " " * 4)
+        msg = header + "(" + msg + "\n)"
         return msg
 
 
@@ -431,14 +436,15 @@ class ObservationGroupEncoder(Module):
 
     The class takes a dictionary of dictionaries, @observation_group_shapes.
     Each key corresponds to a observation group (e.g. 'obs', 'subgoal', 'goal')
-    and each OrderedDict should be a map between modalities and 
+    and each OrderedDict should be a map between modalities and
     expected input shapes (e.g. { 'image' : (3, 120, 160) }).
     """
+
     def __init__(
         self,
-        observation_group_shapes,
-        feature_activation=nn.ReLU,
-        encoder_kwargs=None,
+        observation_group_shapes: OrderedDict[str, OrderedDict],
+        feature_activation: type[nn.Module] | None = nn.ReLU,
+        encoder_kwargs: dict | None = None,
     ):
         """
         Args:
@@ -472,7 +478,7 @@ class ObservationGroupEncoder(Module):
         # type checking
         assert isinstance(observation_group_shapes, OrderedDict)
         assert np.all([isinstance(observation_group_shapes[k], OrderedDict) for k in observation_group_shapes])
-        
+
         self.observation_group_shapes = observation_group_shapes
 
         # create an observation encoder per observation group
@@ -490,7 +496,7 @@ class ObservationGroupEncoder(Module):
 
         Args:
             inputs (dict): dictionary that maps observation groups to observation
-                dictionaries of torch.Tensor batches that agree with 
+                dictionaries of torch.Tensor batches that agree with
                 @self.observation_group_shapes. All observation groups in
                 @self.observation_group_shapes must be present, but additional
                 observation groups can also be present. Note that these are specified
@@ -502,17 +508,17 @@ class ObservationGroupEncoder(Module):
         """
 
         # ensure all observation groups we need are present
-        assert set(self.observation_group_shapes.keys()).issubset(inputs), "{} does not contain all observation groups {}".format(
-            list(inputs.keys()), list(self.observation_group_shapes.keys())
+        assert set(self.observation_group_shapes.keys()).issubset(inputs), (
+            "{} does not contain all observation groups {}".format(
+                list(inputs.keys()), list(self.observation_group_shapes.keys())
+            )
         )
 
         outputs = []
         # Deterministic order since self.observation_group_shapes is OrderedDict
         for obs_group in self.observation_group_shapes:
             # pass through encoder
-            outputs.append(
-                self.nets[obs_group].forward(inputs[obs_group])
-            )
+            outputs.append(self.nets[obs_group].forward(inputs[obs_group]))
 
         return torch.cat(outputs, dim=-1)
 
@@ -528,35 +534,36 @@ class ObservationGroupEncoder(Module):
 
     def __repr__(self):
         """Pretty print network."""
-        header = '{}'.format(str(self.__class__.__name__))
-        msg = ''
+        header = "{}".format(str(self.__class__.__name__))
+        msg = ""
         for k in self.observation_group_shapes:
-            msg += '\n'
-            indent = ' ' * 4
+            msg += "\n"
+            indent = " " * 4
             msg += textwrap.indent("group={}\n{}".format(k, self.nets[k]), indent)
-        msg = header + '(' + msg + '\n)'
+        msg = header + "(" + msg + "\n)"
         return msg
 
 
 class MIMO_MLP(Module):
     """
     Extension to MLP to accept multiple observation dictionaries as input and
-    to output dictionaries of tensors. Inputs are specified as a dictionary of 
+    to output dictionaries of tensors. Inputs are specified as a dictionary of
     observation dictionaries, with each key corresponding to an observation group.
 
     This module utilizes @ObservationGroupEncoder to process the multiple input dictionaries and
     @ObservationDecoder to generate tensor dictionaries. The default behavior
     for encoding the inputs is to process visual inputs with a learned CNN and concatenating
-    the flat encodings with the other flat inputs. The default behavior for generating 
+    the flat encodings with the other flat inputs. The default behavior for generating
     outputs is to use a linear layer branch to produce each modality separately
     (including visual outputs).
     """
+
     def __init__(
         self,
         input_obs_group_shapes,
         output_shapes,
         layer_dims,
-        layer_func=nn.Linear, 
+        layer_func=nn.Linear,
         activation=nn.ReLU,
         encoder_kwargs=None,
     ):
@@ -620,7 +627,7 @@ class MIMO_MLP(Module):
             layer_dims=layer_dims[:-1],
             layer_func=layer_func,
             activation=activation,
-            output_activation=activation, # make sure non-linearity is applied before decoder
+            output_activation=activation,  # make sure non-linearity is applied before decoder
         )
 
         # decoder for output modalities
@@ -634,9 +641,9 @@ class MIMO_MLP(Module):
         Returns output shape for this module, which is a dictionary instead
         of a list since outputs are dictionaries.
         """
-        return { k : list(self.output_shapes[k]) for k in self.output_shapes }
+        return {k: list(self.output_shapes[k]) for k in self.output_shapes}
 
-    def forward(self, **inputs):
+    def forward(self, **inputs: dict):
         """
         Process each set of inputs in its own observation group.
 
@@ -658,19 +665,19 @@ class MIMO_MLP(Module):
         """
         Subclasses should override this method to print out info about network / policy.
         """
-        return ''
+        return ""
 
     def __repr__(self):
         """Pretty print network."""
-        header = '{}'.format(str(self.__class__.__name__))
-        msg = ''
-        indent = ' ' * 4
-        if self._to_string() != '':
+        header = "{}".format(str(self.__class__.__name__))
+        msg = ""
+        indent = " " * 4
+        if self._to_string() != "":
             msg += textwrap.indent("\n" + self._to_string() + "\n", indent)
         msg += textwrap.indent("\nencoder={}".format(self.nets["encoder"]), indent)
         msg += textwrap.indent("\n\nmlp={}".format(self.nets["mlp"]), indent)
         msg += textwrap.indent("\n\ndecoder={}".format(self.nets["decoder"]), indent)
-        msg = header + '(' + msg + '\n)'
+        msg = header + "(" + msg + "\n)"
         return msg
 
 
@@ -681,8 +688,9 @@ class RNN_MIMO_MLP(Module):
     Structure: [encoder -> rnn -> mlp -> decoder]
 
     All temporal inputs are processed by a shared @ObservationGroupEncoder,
-    followed by an RNN, and then a per-step multi-output MLP. 
+    followed by an RNN, and then a per-step multi-output MLP.
     """
+
     def __init__(
         self,
         input_obs_group_shapes,
@@ -716,7 +724,7 @@ class RNN_MIMO_MLP(Module):
             rnn_kwargs (dict): kwargs for the rnn model
 
             per_step (bool): if True, apply the MLP and observation decoder into @output_shapes
-                at every step of the RNN. Otherwise, apply them to the final hidden state of the 
+                at every step of the RNN. Otherwise, apply them to the final hidden state of the
                 RNN.
 
             encoder_kwargs (dict or None): If None, results in default encoder_kwargs being applied. Otherwise, should
@@ -757,18 +765,18 @@ class RNN_MIMO_MLP(Module):
 
         # bidirectional RNNs mean that the output of RNN will be twice the hidden dimension
         rnn_is_bidirectional = rnn_kwargs.get("bidirectional", False)
-        num_directions = int(rnn_is_bidirectional) + 1 # 2 if bidirectional, 1 otherwise
+        num_directions = int(rnn_is_bidirectional) + 1  # 2 if bidirectional, 1 otherwise
         rnn_output_dim = num_directions * rnn_hidden_dim
 
         per_step_net = None
-        self._has_mlp = (len(mlp_layer_dims) > 0)
+        self._has_mlp = len(mlp_layer_dims) > 0
         if self._has_mlp:
             self.nets["mlp"] = MLP(
                 input_dim=rnn_output_dim,
                 output_dim=mlp_layer_dims[-1],
                 layer_dims=mlp_layer_dims[:-1],
                 output_activation=mlp_activation,
-                layer_func=mlp_layer_func
+                layer_func=mlp_layer_func,
             )
             self.nets["decoder"] = ObservationDecoder(
                 decode_shapes=self.output_shapes,
@@ -791,7 +799,7 @@ class RNN_MIMO_MLP(Module):
             rnn_num_layers=rnn_num_layers,
             rnn_type=rnn_type,
             per_step_net=per_step_net,
-            rnn_kwargs=rnn_kwargs
+            rnn_kwargs=rnn_kwargs,
         )
 
     def get_rnn_init_state(self, batch_size, device):
@@ -824,10 +832,11 @@ class RNN_MIMO_MLP(Module):
         obs_group = list(self.input_obs_group_shapes.keys())[0]
         mod = list(self.input_obs_group_shapes[obs_group].keys())[0]
         T = input_shape[obs_group][mod][0]
-        TensorUtils.assert_size_at_dim(input_shape, size=T, dim=0, 
-                msg="RNN_MIMO_MLP: input_shape inconsistent in temporal dimension")
+        TensorUtils.assert_size_at_dim(
+            input_shape, size=T, dim=0, msg="RNN_MIMO_MLP: input_shape inconsistent in temporal dimension"
+        )
         # returns a dictionary instead of list since outputs are dictionaries
-        return { k : [T] + list(self.output_shapes[k]) for k in self.output_shapes }
+        return {k: [T] + list(self.output_shapes[k]) for k in self.output_shapes}
 
     def forward(self, rnn_init_state=None, return_state=False, **inputs):
         """
@@ -859,13 +868,13 @@ class RNN_MIMO_MLP(Module):
         assert rnn_inputs.ndim == 3  # [B, T, D]
         if self.per_step:
             return self.nets["rnn"].forward(inputs=rnn_inputs, rnn_init_state=rnn_init_state, return_state=return_state)
-        
+
         # apply MLP + decoder to last RNN output
         outputs = self.nets["rnn"].forward(inputs=rnn_inputs, rnn_init_state=rnn_init_state, return_state=return_state)
         if return_state:
             outputs, rnn_state = outputs
 
-        assert outputs.ndim == 3 # [B, T, D]
+        assert outputs.ndim == 3  # [B, T, D]
         if self._has_mlp:
             outputs = self.nets["decoder"](self.nets["mlp"](outputs[:, -1]))
         else:
@@ -881,7 +890,7 @@ class RNN_MIMO_MLP(Module):
 
         Args:
             inputs (dict): expects same modalities as @self.input_shapes, with
-                additional batch dimension (but NOT time), since this is a 
+                additional batch dimension (but NOT time), since this is a
                 single time step.
 
             rnn_state (torch.Tensor): rnn hidden state
@@ -892,12 +901,12 @@ class RNN_MIMO_MLP(Module):
 
             rnn_state: return the new rnn state
         """
-        # ensure that the only extra dimension is batch dim, not temporal dim 
+        # ensure that the only extra dimension is batch dim, not temporal dim
         assert np.all([inputs[k].ndim - 1 == len(self.input_shapes[k]) for k in self.input_shapes])
 
         inputs = TensorUtils.to_sequence(inputs)
         outputs, rnn_state = self.forward(
-            inputs, 
+            inputs,
             rnn_init_state=rnn_state,
             return_state=True,
         )
@@ -910,32 +919,33 @@ class RNN_MIMO_MLP(Module):
         """
         Subclasses should override this method to print out info about network / policy.
         """
-        return ''
+        return ""
 
     def __repr__(self):
         """Pretty print network."""
-        header = '{}'.format(str(self.__class__.__name__))
-        msg = ''
-        indent = ' ' * 4
+        header = "{}".format(str(self.__class__.__name__))
+        msg = ""
+        indent = " " * 4
         msg += textwrap.indent("\n" + self._to_string(), indent)
         msg += textwrap.indent("\n\nencoder={}".format(self.nets["encoder"]), indent)
         msg += textwrap.indent("\n\nrnn={}".format(self.nets["rnn"]), indent)
-        msg = header + '(' + msg + '\n)'
+        msg = header + "(" + msg + "\n)"
         return msg
 
 
 class MIMO_Transformer(Module):
     """
-    Extension to Transformer (based on GPT architecture) to accept multiple observation 
-    dictionaries as input and to output dictionaries of tensors. Inputs are specified as 
+    Extension to Transformer (based on GPT architecture) to accept multiple observation
+    dictionaries as input and to output dictionaries of tensors. Inputs are specified as
     a dictionary of observation dictionaries, with each key corresponding to an observation group.
     This module utilizes @ObservationGroupEncoder to process the multiple input dictionaries and
     @ObservationDecoder to generate tensor dictionaries. The default behavior
     for encoding the inputs is to process visual inputs with a learned CNN and concatenating
-    the flat encodings with the other flat inputs. The default behavior for generating 
+    the flat encodings with the other flat inputs. The default behavior for generating
     outputs is to use a linear layer branch to produce each modality separately
     (including visual outputs).
     """
+
     def __init__(
         self,
         input_obs_group_shapes,
@@ -963,7 +973,7 @@ class MIMO_Transformer(Module):
             transformer_embed_dim (int): dimension for embeddings used by transformer
             transformer_num_layers (int): number of transformer blocks to stack
             transformer_num_heads (int): number of attention heads for each
-                transformer block - must divide @transformer_embed_dim evenly. Self-attention is 
+                transformer block - must divide @transformer_embed_dim evenly. Self-attention is
                 computed over this many partitions of the embedding dimension separately.
             transformer_context_length (int): expected length of input sequences
             transformer_activation: non-linearity for input and output layers used in transformer
@@ -973,7 +983,7 @@ class MIMO_Transformer(Module):
             encoder_kwargs (dict): observation encoder config
         """
         super(MIMO_Transformer, self).__init__()
-        
+
         assert isinstance(input_obs_group_shapes, OrderedDict)
         assert np.all([isinstance(input_obs_group_shapes[k], OrderedDict) for k in input_obs_group_shapes])
         assert isinstance(output_shapes, OrderedDict)
@@ -994,27 +1004,21 @@ class MIMO_Transformer(Module):
         # flat encoder output dimension
         transformer_input_dim = self.nets["encoder"].output_shape()[0]
 
-        self.nets["embed_encoder"] = nn.Linear(
-            transformer_input_dim, transformer_embed_dim
-        )
+        self.nets["embed_encoder"] = nn.Linear(transformer_input_dim, transformer_embed_dim)
 
         max_timestep = transformer_context_length
 
         if transformer_sinusoidal_embedding:
             self.nets["embed_timestep"] = PositionalEncoding(transformer_embed_dim)
         elif transformer_nn_parameter_for_timesteps:
-            assert (
-                not transformer_sinusoidal_embedding
-            ), "nn.Parameter only works with learned embeddings"
-            self.params["embed_timestep"] = nn.Parameter(
-                torch.zeros(1, max_timestep, transformer_embed_dim)
-            )
+            assert not transformer_sinusoidal_embedding, "nn.Parameter only works with learned embeddings"
+            self.params["embed_timestep"] = nn.Parameter(torch.zeros(1, max_timestep, transformer_embed_dim))
         else:
             self.nets["embed_timestep"] = nn.Embedding(max_timestep, transformer_embed_dim)
 
         # layer norm for embeddings
         self.nets["embed_ln"] = nn.LayerNorm(transformer_embed_dim)
-        
+
         # dropout for input embeddings
         self.nets["embed_drop"] = nn.Dropout(transformer_emb_dropout)
 
@@ -1045,7 +1049,7 @@ class MIMO_Transformer(Module):
         Returns output shape for this module, which is a dictionary instead
         of a list since outputs are dictionaries.
         """
-        return { k : list(self.output_shapes[k]) for k in self.output_shapes }
+        return {k: list(self.output_shapes[k]) for k in self.output_shapes}
 
     def embed_timesteps(self, embeddings):
         """
@@ -1080,9 +1084,7 @@ class MIMO_Transformer(Module):
             # compute how many modalities were combined into embeddings, replicate time embeddings that many times
             num_replicates = embeddings.shape[-1] // self.transformer_embed_dim
             time_embeddings = torch.cat([time_embeddings for _ in range(num_replicates)], -1)
-            assert (
-                embeddings.shape == time_embeddings.shape
-            ), f"{embeddings.shape}, {time_embeddings.shape}"
+            assert embeddings.shape == time_embeddings.shape, f"{embeddings.shape}, {time_embeddings.shape}"
         return time_embeddings
 
     def input_embedding(
@@ -1105,7 +1107,6 @@ class MIMO_Transformer(Module):
 
         return embeddings
 
-    
     def forward(self, **inputs):
         """
         Process each set of inputs in its own observation group.
@@ -1130,9 +1131,7 @@ class MIMO_Transformer(Module):
         inputs = inputs.copy()
 
         transformer_encoder_outputs = None
-        transformer_inputs = TensorUtils.time_distributed(
-            inputs, self.nets["encoder"], inputs_as_kwargs=True
-        )
+        transformer_inputs = TensorUtils.time_distributed(inputs, self.nets["encoder"], inputs_as_kwargs=True)
         assert transformer_inputs.ndim == 3  # [B, T, D]
 
         if transformer_encoder_outputs is None:
@@ -1142,9 +1141,7 @@ class MIMO_Transformer(Module):
 
         transformer_outputs = transformer_encoder_outputs
         # apply decoder to each timestep of sequence to get a dictionary of outputs
-        transformer_outputs = TensorUtils.time_distributed(
-            transformer_outputs, self.nets["decoder"]
-        )
+        transformer_outputs = TensorUtils.time_distributed(transformer_outputs, self.nets["decoder"])
         transformer_outputs["transformer_encoder_outputs"] = transformer_encoder_outputs
         return transformer_outputs
 
@@ -1152,17 +1149,17 @@ class MIMO_Transformer(Module):
         """
         Subclasses should override this method to print out info about network / policy.
         """
-        return ''
+        return ""
 
     def __repr__(self):
         """Pretty print network."""
-        header = '{}'.format(str(self.__class__.__name__))
-        msg = ''
-        indent = ' ' * 4
-        if self._to_string() != '':
+        header = "{}".format(str(self.__class__.__name__))
+        msg = ""
+        indent = " " * 4
+        if self._to_string() != "":
             msg += textwrap.indent("\n" + self._to_string() + "\n", indent)
         msg += textwrap.indent("\nencoder={}".format(self.nets["encoder"]), indent)
         msg += textwrap.indent("\n\ntransformer={}".format(self.nets["transformer"]), indent)
         msg += textwrap.indent("\n\ndecoder={}".format(self.nets["decoder"]), indent)
-        msg = header + '(' + msg + '\n)'
+        msg = header + "(" + msg + "\n)"
         return msg

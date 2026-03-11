@@ -4,31 +4,35 @@ to provide a standardized environment API for training policies and interacting
 with metadata present in datasets.
 """
 
+from __future__ import annotations
+
 import json
 from copy import deepcopy
+from typing import TYPE_CHECKING
 
 import gymnasium as gym
-import numpy as np
-
-try:
-    import d4rl
-except:
-    print("WARNING: could not load d4rl environments!")
+import torch
 
 import robomimic.envs.env_base as EB
 import robomimic.utils.obs_utils as ObsUtils
 
+if TYPE_CHECKING:
+    from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv
 
-class EnvGym(EB.EnvBase):
+
+class EnvIsaacLab(EB.EnvBase):
     """Wrapper class for gym"""
 
     def __init__(
         self,
-        env_name,
-        render=False,
-        render_offscreen=False,
-        use_image_obs=False,
-        use_depth_obs=False,
+        env_name: str,
+        render: bool = False,
+        render_offscreen: bool = False,
+        use_image_obs: bool = False,
+        use_depth_obs: bool = False,
+        num_envs: int | None = None,
+        seed: int | None = None,
+        episode_length: int | None = None,
         **kwargs,
     ):
         """
@@ -42,44 +46,93 @@ class EnvGym(EB.EnvBase):
 
             use_image_obs (bool): ignored - gym envs don't typically use images
         """
+        from isaaclab_tasks.utils import load_cfg_from_registry
+
         self._init_kwargs = deepcopy(kwargs)
         self._env_name = env_name
         self._current_obs = None
         self._current_reward = None
         self._current_done = None
         self._done = None
-        self.env = gym.make(env_name, **kwargs)
+        # load env config
+        env_cfg = load_cfg_from_registry(env_name, "env_cfg_entry_point")
+        # reduce num_envs to necessary # of rollouts, otherwise keep env_cfg.num_envs
+        if num_envs and num_envs < env_cfg.scene.num_envs:
+            env_cfg.scene.num_envs = num_envs
+        if seed is not None:
+            env_cfg.seed = seed
+        if episode_length:
+            env_cfg.episode_length_s = episode_length / (env_cfg.sim.dt * env_cfg.decimation)
+        self.env = gym.make(env_name, cfg=env_cfg, render_mode="rgb_array" if render_offscreen else None, **kwargs)
 
-    def step(self, action):
+    @property
+    def unwrapped(self) -> ManagerBasedRLEnv | DirectRLEnv:
+        from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv
+
+        env = self.env.unwrapped
+        assert isinstance(env, ManagerBasedRLEnv) or isinstance(env, DirectRLEnv)
+        return env
+
+    def step(
+        self, action: torch.Tensor
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        dict[str, torch.Tensor],
+    ]:
         """
         Step in the environment with an action.
 
         Args:
-            action (np.array): action to take
+            action (torch.Tensor): action to take
 
         Returns:
             observation (dict): new observation dictionary
-            reward (float): reward for this step
-            done (bool): whether the task is done
+            reward (torch.Tensor): environment rewards for this step
+            done (torch.Tensor): whether the task is done per environment
             info (dict): extra information
         """
-        obs, reward, done, info = self.env.step(action)
-        self._current_obs = obs
-        self._current_reward = reward
-        self._current_done = done
-        return self.get_observation(obs), reward, self.is_done(), info
+        obs_dict, rew, terminated, truncated, extras = self.env.step(action)
+        # compute dones
+        dones = (terminated | truncated).to(dtype=torch.long)
+        if not self.unwrapped.cfg.is_finite_horizon:
+            extras["time_outs"] = truncated
+        return self.get_observation(obs_dict), rew, dones, extras
 
-    def reset(self):
+    def reset(self) -> dict[str, torch.Tensor]:
         """
         Reset environment.
 
         Returns:
             observation (dict): initial observation dictionary.
         """
-        self._current_obs, _ = self.env.reset()
-        self._current_reward = None
-        self._current_done = None
-        return self.get_observation(self._current_obs)
+        obs_dict, extras = self.env.reset()
+        return self.get_observation(obs_dict)
+
+    def render(
+        self,
+        mode: str = "human",
+        height: int | None = None,
+        width: int | None = None,
+        camera_name=None,
+        **kwargs,
+    ):
+        """
+        Render from simulation to either an on-screen window or off-screen to RGB array.
+
+        Args:
+            mode (str): pass "human" for on-screen rendering or "rgb_array" for off-screen rendering
+            height (int): height of image to render - only used if mode is "rgb_array"
+            width (int): width of image to render - only used if mode is "rgb_array"
+        """
+        return self.env.render()
+        # if mode == "human":
+        #     return self.env.render(mode=mode, **kwargs)
+        # if mode == "rgb_array":
+        #     return self.env.render(mode="rgb_array", height=height, width=width)
+        # else:
+        #     raise NotImplementedError("mode={} is not implemented".format(mode))
 
     def reset_to(self, state):
         """
@@ -92,30 +145,9 @@ class EnvGym(EB.EnvBase):
         Returns:
             observation (dict): observation dictionary after setting the simulator state
         """
-        if hasattr(self.env.unwrapped.sim, "set_state_from_flattened"):
-            self.env.unwrapped.sim.set_state_from_flattened(state["states"])
-            self.env.unwrapped.sim.forward()
-            return {"flat": self.env.unwrapped._get_obs()}
-        else:
-            raise NotImplementedError
+        raise NotImplementedError
 
-    def render(self, mode="human", height=None, width=None, camera_name=None, **kwargs):
-        """
-        Render from simulation to either an on-screen window or off-screen to RGB array.
-
-        Args:
-            mode (str): pass "human" for on-screen rendering or "rgb_array" for off-screen rendering
-            height (int): height of image to render - only used if mode is "rgb_array"
-            width (int): width of image to render - only used if mode is "rgb_array"
-        """
-        if mode == "human":
-            return self.env.render(mode=mode, **kwargs)
-        if mode == "rgb_array":
-            return self.env.render(mode="rgb_array", height=height, width=width)
-        else:
-            raise NotImplementedError("mode={} is not implemented".format(mode))
-
-    def get_observation(self, obs=None):
+    def get_observation(self, obs: dict[str, torch.Tensor] | None = None) -> dict[str, torch.Tensor]:
         """
         Get current environment observation dictionary.
 
@@ -124,25 +156,24 @@ class EnvGym(EB.EnvBase):
                 If not provided, uses self._current_obs.
         """
         if obs is None:
-            assert self._current_obs is not None
-            obs = self._current_obs
-        return {"flat": np.copy(obs)}
+            if hasattr(self.env, "observation_manager"):
+                obs, _ = self.unwrapped.observation_manager.compute()  # type: ignore
+            else:
+                obs, _ = self.unwrapped._get_observations()  # type: ignore
+        assert isinstance(obs, dict) and "imitation" in obs and isinstance(obs["imitation"], dict)
+        return obs["imitation"]
 
     def get_state(self):
         """
         Get current environment simulator state as a dictionary. Should be compatible with @reset_to.
         """
-        # NOTE: assumes MuJoCo gym task!
-        xml = self.env.sim.model.get_xml()  # model xml file
-        state = np.array(self.env.sim.get_state().flatten())  # simulator state
-        return dict(model=xml, states=state)
+        raise NotImplementedError
 
     def get_reward(self):
         """
         Get current reward.
         """
-        assert self._current_reward is not None
-        return self._current_reward
+        raise NotImplementedError
 
     def get_goal(self):
         """
@@ -160,8 +191,7 @@ class EnvGym(EB.EnvBase):
         """
         Check if the task is done (not necessarily successful).
         """
-        assert self._current_done is not None
-        return self._current_done
+        raise NotImplementedError
 
     def is_success(self):
         """
@@ -169,8 +199,8 @@ class EnvGym(EB.EnvBase):
         { str: bool } with at least a "task" key for the overall task success,
         and additional optional keys corresponding to other task criteria.
         """
-        if hasattr(self.env.unwrapped, "_check_success"):
-            return self.env.unwrapped._check_success()
+        if hasattr(self.unwrapped, "_check_success"):
+            return self.unwrapped._check_success()
 
         # gym envs generally don't check task success - we only compare returns
         return {"task": False}
@@ -180,7 +210,10 @@ class EnvGym(EB.EnvBase):
         """
         Returns dimension of actions (int).
         """
-        return self.env.action_space.shape[0]
+        if hasattr(self.unwrapped, "action_manager"):
+            return self.unwrapped.action_manager.total_action_dim
+        else:
+            return gym.spaces.flatdim(self.unwrapped.single_action_space)
 
     @property
     def name(self):
@@ -195,7 +228,7 @@ class EnvGym(EB.EnvBase):
         Returns environment type (int) for this kind of environment.
         This helps identify this env class.
         """
-        return EB.EnvType.GYM_TYPE
+        return EB.EnvType.ISAACLAB_TYPE
 
     def serialize(self):
         """
@@ -258,7 +291,7 @@ class EnvGym(EB.EnvBase):
         """
         Grabs base simulation environment.
         """
-        return self.env
+        return self.unwrapped
 
     def __repr__(self):
         """

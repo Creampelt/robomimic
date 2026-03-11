@@ -3,12 +3,16 @@ This file contains several utility functions for working with environment
 wrappers provided by the repository, and with environment metadata saved
 in dataset files.
 """
+
 from copy import deepcopy
+
 import robomimic.envs.env_base as EB
 from robomimic.utils.log_utils import log_warning
 
 
-def get_env_class(env_meta=None, env_type=None, env=None):
+def get_env_class(
+    env_meta: dict | None = None, env_type: EB.EnvType | None = None, env: EB.EnvBase | None = None
+) -> type[EB.EnvBase]:
     """
     Return env class from either env_meta, env_type, or env.
     Note the use of lazy imports - this ensures that modules are only
@@ -34,13 +38,20 @@ def get_env_class(env_meta=None, env_type=None, env=None):
     env_type = get_env_type(env_meta=env_meta, env_type=env_type, env=env)
     if env_type == EB.EnvType.ROBOSUITE_TYPE:
         from robomimic.envs.env_robosuite import EnvRobosuite
+
         return EnvRobosuite
     elif env_type == EB.EnvType.GYM_TYPE:
         from robomimic.envs.env_gym import EnvGym
+
         return EnvGym
     elif env_type == EB.EnvType.IG_MOMART_TYPE:
         from robomimic.envs.env_ig_momart import EnvGibsonMOMART
+
         return EnvGibsonMOMART
+    elif env_type == EB.EnvType.ISAACLAB_TYPE:
+        from robomimic.envs.env_isaaclab import EnvIsaacLab
+
+        return EnvIsaacLab
     raise Exception("code should never reach this point")
 
 
@@ -93,7 +104,7 @@ def check_env_type(type_to_check, env_meta=None, env_type=None, env=None):
         env (instance of EB.EnvBase): environment instance
     """
     env_type = get_env_type(env_meta=env_meta, env_type=env_type, env=env)
-    return (env_type == type_to_check)
+    return env_type == type_to_check
 
 
 def check_env_version(env, env_meta):
@@ -115,13 +126,13 @@ def check_env_version(env, env_meta):
 
     if env_meta_version is None:
         log_warning(
-            "No environment version found in dataset!"\
-            "\nCannot verify if dataset and installed environment versions match"\
+            "No environment version found in dataset!"
+            "\nCannot verify if dataset and installed environment versions match"
         )
     elif env_system_version != env_meta_version:
         log_warning(
-            "Dataset and installed environment version mismatch!"\
-            "\nDataset environment version: {meta}"\
+            "Dataset and installed environment version mismatch!"
+            "\nDataset environment version: {meta}"
             "\nInstalled environment version: {sys}".format(
                 sys=env_system_version,
                 meta=env_meta_version,
@@ -139,11 +150,11 @@ def is_robosuite_env(env_meta=None, env_type=None, env=None):
 
 def create_env(
     env_type,
-    env_name,  
-    render=False, 
-    render_offscreen=False, 
-    use_image_obs=False, 
-    use_depth_obs=False, 
+    env_name,
+    render=False,
+    render_offscreen=False,
+    use_image_obs=False,
+    use_depth_obs=False,
     lang=None,
     **kwargs,
 ):
@@ -174,9 +185,9 @@ def create_env(
 
     env_class = get_env_class(env_type=env_type)
     env = env_class(
-        env_name=env_name, 
-        render=render, 
-        render_offscreen=render_offscreen, 
+        env_name=env_name,
+        render=render,
+        render_offscreen=render_offscreen,
         use_image_obs=use_image_obs,
         use_depth_obs=use_depth_obs,
         lang=lang,
@@ -189,11 +200,11 @@ def create_env(
 
 def create_env_from_metadata(
     env_meta,
-    env_name=None,  
-    render=False, 
-    render_offscreen=False, 
-    use_image_obs=False, 
-    use_depth_obs=False, 
+    env_name=None,
+    render=False,
+    render_offscreen=False,
+    use_image_obs=False,
+    use_depth_obs=False,
 ):
     """
     Create environment.
@@ -232,10 +243,10 @@ def create_env_from_metadata(
 
     env = create_env(
         env_type=env_type,
-        render=render, 
-        render_offscreen=render_offscreen, 
-        use_image_obs=use_image_obs, 
-        use_depth_obs=use_depth_obs, 
+        render=render,
+        render_offscreen=render_offscreen,
+        use_image_obs=use_image_obs,
+        use_depth_obs=use_depth_obs,
         lang=lang,
         **env_kwargs,
     )
@@ -245,15 +256,15 @@ def create_env_from_metadata(
 
 def create_env_for_data_processing(
     env_meta,
-    camera_names, 
-    camera_height, 
-    camera_width, 
+    camera_names,
+    camera_height,
+    camera_width,
     reward_shaping,
     env_class=None,
-    render=None, 
-    render_offscreen=None, 
-    use_image_obs=None, 
-    use_depth_obs=None, 
+    render=None,
+    render_offscreen=None,
+    use_image_obs=None,
+    use_depth_obs=None,
 ):
     """
     Creates environment for processing dataset observations and rewards.
@@ -302,14 +313,14 @@ def create_env_for_data_processing(
     env_kwargs.pop("use_depth_obs", None)
 
     env = env_class.create_for_data_processing(
-        env_name=env_name, 
-        camera_names=camera_names, 
-        camera_height=camera_height, 
-        camera_width=camera_width, 
-        reward_shaping=reward_shaping, 
-        render=render, 
-        render_offscreen=render_offscreen, 
-        use_image_obs=use_image_obs, 
+        env_name=env_name,
+        camera_names=camera_names,
+        camera_height=camera_height,
+        camera_width=camera_width,
+        reward_shaping=reward_shaping,
+        render=render,
+        render_offscreen=render_offscreen,
+        use_image_obs=use_image_obs,
         use_depth_obs=use_depth_obs,
         **env_kwargs,
     )
@@ -325,12 +336,11 @@ def set_env_specific_obs_processing(env_meta=None, env_type=None, env=None):
     """
     if is_robosuite_env(env_meta=env_meta, env_type=env_type, env=env):
         from robomimic.utils.obs_utils import DepthModality, process_frame, unprocess_frame
-        DepthModality.set_obs_processor(processor=(
-            lambda obs: process_frame(frame=obs, channel_dim=1, scale=None)
-        ))
-        DepthModality.set_obs_unprocessor(unprocessor=(
-            lambda obs: unprocess_frame(frame=obs, channel_dim=1, scale=None)
-        ))
+
+        DepthModality.set_obs_processor(processor=(lambda obs: process_frame(frame=obs, channel_dim=1, scale=None)))
+        DepthModality.set_obs_unprocessor(
+            unprocessor=(lambda obs: unprocess_frame(frame=obs, channel_dim=1, scale=None))
+        )
 
 
 def wrap_env_from_config(env, config):
@@ -340,6 +350,7 @@ def wrap_env_from_config(env, config):
     """
     if ("frame_stack" in config.train) and (config.train.frame_stack > 1):
         from robomimic.envs.wrappers import FrameStackWrapper
+
         env = FrameStackWrapper(env, num_frames=config.train.frame_stack)
 
     return env

@@ -3,7 +3,11 @@ This file contains the base class for environment wrappers that are used
 to provide a standardized environment API for training policies and interacting
 with metadata present in datasets.
 """
+
 import abc
+
+import numpy as np
+import torch
 
 
 class EnvType:
@@ -11,21 +15,24 @@ class EnvType:
     Holds environment types - one per environment class.
     These act as identifiers for different environments.
     """
+
     ROBOSUITE_TYPE = 1
     GYM_TYPE = 2
     IG_MOMART_TYPE = 3
+    ISAACLAB_TYPE = 4
 
 
 class EnvBase(abc.ABC):
     """A base class method for environments used by this repo."""
+
     @abc.abstractmethod
     def __init__(
         self,
-        env_name, 
-        render=False, 
-        render_offscreen=False, 
-        use_image_obs=False, 
-        use_depth_obs=False, 
+        env_name,
+        render=False,
+        render_offscreen=False,
+        use_image_obs=False,
+        use_depth_obs=False,
         **kwargs,
     ):
         """
@@ -49,7 +56,9 @@ class EnvBase(abc.ABC):
         return
 
     @abc.abstractmethod
-    def step(self, action):
+    def step(
+        self, action: torch.Tensor | np.ndarray
+    ) -> tuple[dict, float, bool, dict] | tuple[dict, torch.Tensor, torch.Tensor, dict]:
         """
         Step in the environment with an action.
 
@@ -65,7 +74,7 @@ class EnvBase(abc.ABC):
         return
 
     @abc.abstractmethod
-    def reset(self):
+    def reset(self) -> dict[str, torch.Tensor] | dict[str, np.ndarray]:
         """
         Reset environment.
 
@@ -81,7 +90,7 @@ class EnvBase(abc.ABC):
 
         Args:
             state (dict): current simulator state
-        
+
         Returns:
             observation (dict): observation dictionary after setting the simulator state
         """
@@ -184,21 +193,21 @@ class EnvBase(abc.ABC):
     @classmethod
     @abc.abstractmethod
     def create_for_data_processing(
-        cls, 
-        camera_names, 
-        camera_height, 
-        camera_width, 
-        reward_shaping, 
-        render=None, 
-        render_offscreen=None, 
-        use_image_obs=None, 
-        use_depth_obs=None, 
+        cls,
+        camera_names,
+        camera_height,
+        camera_width,
+        reward_shaping,
+        render=None,
+        render_offscreen=None,
+        use_image_obs=None,
+        use_depth_obs=None,
         **kwargs,
     ):
         """
         Create environment for processing datasets, which includes extracting
         observations, labeling dense / sparse rewards, and annotating dones in
-        transitions. 
+        transitions.
 
         Args:
             camera_names ([str]): list of camera names that correspond to image observations

@@ -1,16 +1,20 @@
 """
 Set of general purpose utility functions for easier interfacing with Python API
 """
+
 import inspect
 from copy import deepcopy
-from typing import Union, Sequence, Dict, Optional, Tuple
+from typing import Any, Sequence, TypeVar
 
 import numpy as np
+import torch
 
 import robomimic.macros as Macros
 
+T = TypeVar("T", torch.Tensor, np.ndarray)
 
-def get_class_init_kwargs(cls):
+
+def get_class_init_kwargs(cls: object) -> list[str]:
     """
     Helper function to return a list of all valid keyword arguments (excluding "self") for the given @cls class.
 
@@ -23,13 +27,13 @@ def get_class_init_kwargs(cls):
     return list(inspect.signature(cls.__init__).parameters.keys())[1:]
 
 
-def extract_subset_dict(dic, keys, copy=False):
+def extract_subset_dict(dic: dict[str, Any], keys: list[str], copy: bool = False) -> dict[str, Any]:
     """
     Helper function to extract a subset of dictionary key-values from a current dictionary. Optionally (deep)copies
     the values extracted from the original @dic if @copy is True.
 
     Args:
-        dic (dict): Dictionary containing multiple key-values
+        dic (dict): dictionary containing multiple key-values
         keys (Iterable): Specific keys to extract from @dic. If the key doesn't exist in @dic, then the key is skipped
         copy (bool): If True, will deepcopy all values corresponding to the specified @keys
 
@@ -40,7 +44,12 @@ def extract_subset_dict(dic, keys, copy=False):
     return deepcopy(subset) if copy else subset
 
 
-def extract_class_init_kwargs_from_dict(cls, dic, copy=False, verbose=False):
+def extract_class_init_kwargs_from_dict(
+    cls: object,
+    dic: dict[str, Any],
+    copy: bool = False,
+    verbose: bool = False,
+) -> dict[str, Any]:
     """
     Helper function to return a dictionary of key-values that specifically correspond to @cls class's __init__
     constructor method, from @dic which may or may not contain additional, irrelevant kwargs.
@@ -49,7 +58,7 @@ def extract_class_init_kwargs_from_dict(cls, dic, copy=False, verbose=False):
 
     Args:
         cls (object): Class from which to grab __init__ kwargs that will be be used as filtering keys for @dic
-        dic (dict): Dictionary containing multiple key-values
+        dic (dict): dictionary containing multiple key-values
         copy (bool): If True, will deepcopy all values corresponding to the specified @keys
         verbose (bool): If True (or if macro DEBUG is True), then will print out mismatched keys
 
@@ -77,13 +86,14 @@ def extract_class_init_kwargs_from_dict(cls, dic, copy=False, verbose=False):
     return subdic
 
 
-def deep_update(d, u):
+def deep_update(d: dict, u: Any) -> dict:
     """
     Deeply update dictionary @d with values from dictionary @u.
 
     Copied from https://stackoverflow.com/a/3233356
     """
     import collections
+
     for k, v in u.items():
         if isinstance(v, collections.abc.Mapping):
             d[k] = deep_update(d.get(k, {}), v)
@@ -92,28 +102,27 @@ def deep_update(d, u):
     return d
 
 
-def action_dict_to_vector(
-        action_dict: Dict[str, np.ndarray], 
-        action_keys: Optional[Sequence[str]]=None) -> np.ndarray:
+def action_dict_to_vector(action_dict: dict[str, T], action_keys: Sequence[str] | None = None) -> T:
+    use_torch = isinstance(next(iter(action_dict.values())), torch.Tensor)
     if action_keys is None:
         action_keys = list(action_dict.keys())
     actions = [action_dict[k] for k in action_keys]
 
-    action_vec = np.concatenate(actions, axis=-1)
+    action_vec = torch.cat(actions, axis=-1) if use_torch else np.concatenate(actions, axis=-1)
     return action_vec
 
 
 def vector_to_action_dict(
-        action: np.ndarray, 
-        action_shapes: Dict[str, Tuple[int]],
-        action_keys: Sequence[str]) -> Dict[str, np.ndarray]:
-    action_dict = dict()
+    action: T,
+    action_shapes: dict[str, tuple[int, ...]],
+    action_keys: Sequence[str],
+) -> dict[str, T]:
+    action_dict: dict[str, T] = dict()
     start_idx = 0
     for key in action_keys:
         this_act_shape = action_shapes[key]
         this_act_dim = np.prod(this_act_shape)
         end_idx = start_idx + this_act_dim
-        action_dict[key] = action[...,start_idx:end_idx].reshape(
-            action.shape[:-1]+this_act_shape)
+        action_dict[key] = action[..., start_idx:end_idx].reshape(action.shape[:-1] + this_act_shape)
         start_idx = end_idx
     return action_dict
