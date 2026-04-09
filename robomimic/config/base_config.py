@@ -120,6 +120,10 @@ class BaseConfig(Config):
         self.experiment.rollout.rate = 50                           # do rollouts every @rate epochs
         self.experiment.rollout.warmstart = 0                       # number of epochs to wait before starting rollouts
         self.experiment.rollout.terminate_on_success = True         # end rollout early after task success
+        # When True, observations are kept as CUDA torch tensors throughout the rollout loop
+        # (instead of numpy arrays), and actions are converted to warp GPU arrays before being
+        # passed to the environment. Requires the environment to be instantiated with use_warp=True.
+        self.experiment.rollout.use_warp = False
 
         # for updating the evaluation env meta data
         self.experiment.env_meta_update_dict = Config()

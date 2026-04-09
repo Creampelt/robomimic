@@ -189,11 +189,13 @@ def create_env(
 
 def create_env_from_metadata(
     env_meta,
-    env_name=None,  
-    render=False, 
-    render_offscreen=False, 
-    use_image_obs=False, 
-    use_depth_obs=False, 
+    env_name=None,
+    render=False,
+    render_offscreen=False,
+    use_image_obs=False,
+    use_depth_obs=False,
+    use_warp: bool = False,
+    num_envs: int = 1,
 ):
     """
     Create environment.
@@ -228,14 +230,16 @@ def create_env_from_metadata(
     env_type = get_env_type(env_meta=env_meta)
     env_kwargs = env_meta["env_kwargs"]
     env_kwargs["env_name"] = env_name
+    env_kwargs["use_warp"] = use_warp
+    env_kwargs["num_envs"] = num_envs
     lang = env_meta.get("lang", None)
 
     env = create_env(
         env_type=env_type,
-        render=render, 
-        render_offscreen=render_offscreen, 
-        use_image_obs=use_image_obs, 
-        use_depth_obs=use_depth_obs, 
+        render=render,
+        render_offscreen=render_offscreen,
+        use_image_obs=use_image_obs,
+        use_depth_obs=use_depth_obs,
         lang=lang,
         **env_kwargs,
     )

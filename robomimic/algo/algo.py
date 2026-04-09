@@ -497,7 +497,13 @@ class RolloutPolicy(object):
     """
     Wraps @Algo object to make it easy to run policies in a rollout loop.
     """
-    def __init__(self, policy, obs_normalization_stats=None, action_normalization_stats=None):
+    def __init__(
+        self,
+        policy,
+        obs_normalization_stats=None,
+        action_normalization_stats=None,
+        use_warp: bool = False,
+    ):
         """
         Args:
             policy (Algo instance): @Algo object to wrap to prepare for rollouts
@@ -506,10 +512,17 @@ class RolloutPolicy(object):
                 normalization. This should map observation keys to dicts
                 with a "mean" and "std" of shape (1, ...) where ... is the default
                 shape for the observation.
+
+            use_warp (bool): if True, observations are expected to already be CUDA torch
+                tensors (as returned by EnvRobosuite when use_warp=True) and actions will
+                be returned as CUDA torch tensors rather than numpy arrays, so that they
+                can be forwarded directly to the warp-enabled environment without any
+                CPU round-trip.
         """
         self.policy = policy
         self.obs_normalization_stats = obs_normalization_stats
         self.action_normalization_stats = action_normalization_stats
+        self.use_warp = use_warp
 
     def start_episode(self):
         """
@@ -523,8 +536,10 @@ class RolloutPolicy(object):
         Prepare raw observation dict from environment for policy.
 
         Args:
-            ob (dict): single observation dictionary from environment (no batch dimension, 
-                and np.array values for each key)
+            ob (dict): single observation dictionary from environment (no batch dimension,
+                and np.array or CUDA torch.Tensor values for each key). When use_warp is
+                True the values are already CUDA tensors and the ``to_tensor`` /
+                ``to_device`` calls become no-ops.
 
             batched_ob (bool): whether the input is already batched
 
@@ -558,10 +573,14 @@ class RolloutPolicy(object):
         Produce action from raw observation dict (and maybe goal dict) from environment.
 
         Args:
-            ob (dict): single observation dictionary from environment (no batch dimension, 
-                and np.array values for each key)
+            ob (dict): single observation dictionary from environment (no batch dimension,
+                and np.array or CUDA torch.Tensor values for each key when use_warp=True)
             goal (dict): goal observation
             batched_ob (bool): whether the input is already batched
+
+        Returns:
+            action: ``np.ndarray`` when use_warp is False, ``torch.Tensor`` on CUDA when
+                use_warp is True (shape ``(num_envs, action_dim)`` in the batched case).
         """
         ob = self._prepare_observation(ob, batched_ob=batched_ob)
         if goal is not None:
@@ -569,6 +588,10 @@ class RolloutPolicy(object):
         ac = self.policy.get_action(obs_dict=ob, goal_dict=goal)
         if not batched_ob:
             ac = ac[0]
+        if self.use_warp:
+            # Keep action as a CUDA torch tensor — the warp-enabled EnvRobosuite.step()
+            # will convert it to a warp array without touching the CPU.
+            return ac
         ac = TensorUtils.to_numpy(ac)
         if self.action_normalization_stats is not None:
             action_keys = self.policy.global_config.train.action_keys

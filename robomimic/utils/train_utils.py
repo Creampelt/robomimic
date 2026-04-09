@@ -387,6 +387,133 @@ def run_rollout(
     return results
 
 
+def run_warp_rollout(
+        policy,
+        env,
+        horizon,
+        use_goals=False,
+        terminate_on_success=False,
+        video_writer=None,
+        video_skip=5,
+    ):
+    """
+    Runs a single vectorized rollout across all parallel MuJoCo Warp environments in @env.
+    Instead of running @num_episodes sequential rollouts, one batched rollout of @horizon
+    steps is executed, with observations and actions handled as batched CUDA tensors.
+
+    Args:
+        policy (RolloutPolicy instance): policy with use_warp=True.
+
+        env (EnvBase instance): warp-enabled environment with env.env.num_envs parallel worlds.
+
+        horizon (int): maximum number of steps per rollout.
+
+        use_goals (bool): if True, retrieve goal observations from env.
+
+        terminate_on_success (bool): if True, end the rollout early once all envs succeed.
+
+        video_writer (imageio Writer): if not None, record frames from env 0 at this writer.
+
+        video_skip (int): write a frame every this many steps.
+
+    Returns:
+        results (list[dict]): one result dict per parallel environment, each containing
+            Return, Horizon, Success_Rate, and any additional success metrics.
+    """
+    assert isinstance(policy, RolloutPolicy)
+    assert isinstance(env, EnvBase) or isinstance(env, EnvWrapper)
+
+    policy.start_episode()
+
+    ob_dict = env.reset()
+    goal_dict = None
+    if use_goals:
+        goal_dict = env.get_goal()
+
+    num_envs = env.env.num_envs  # type: ignore[union-attr]
+
+    rews = []
+    success = None
+    end_step = None
+    step_i = 0
+    video_count = 0
+    video_frames = []
+
+    def _scalar(v, i):
+        """Extract a Python float for env index i from a batched value."""
+        try:
+            return float(v[i])
+        except (TypeError, IndexError):
+            return float(v)
+
+    try:
+        for step_i in range(horizon):
+            # Physics-explosion guard: detect NaN/inf in any observation with a
+            # single GPU→CPU sync (cat all obs tensors, one .all() check).  Only do
+            # the per-key slow path when something is actually broken.
+            # Filter to tensors that share the same leading (batch) dimension to
+            # exclude RNN hidden states or other non-obs tensors with different shapes.
+            _obs_raw = [v for v in ob_dict.values() if isinstance(v, torch.Tensor) and v.dim() >= 1]
+            if _obs_raw:
+                _B = _obs_raw[0].shape[0]
+                _obs_tensors = [v.reshape(_B, -1) for v in _obs_raw if v.shape[0] == _B]
+            else:
+                _obs_tensors = []
+            if _obs_tensors and not torch.cat(_obs_tensors, dim=1).isfinite().all():
+                for k, v in ob_dict.items():
+                    if isinstance(v, torch.Tensor) and not v.isfinite().all():
+                        bad = (~v.isfinite().all(dim=-1) if v.dim() > 1 else ~v.isfinite()).nonzero(as_tuple=False).squeeze(-1)
+                        print(f"[warp] step {step_i}: physics explosion in obs '{k}' for envs {bad.tolist()[:5]} — zeroing")
+                        ob_dict[k] = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+            ac = policy(ob=ob_dict, goal=goal_dict, batched_ob=True)
+            ob_dict, r, done, _ = env.step(ac)
+            rews.append(r)
+
+            cur_success_metrics = env.is_success()
+            if success is None:
+                success = deepcopy(cur_success_metrics)
+            else:
+                for k in success:
+                    success[k] = success[k] | cur_success_metrics[k]
+
+            # Capture a frame from env 0 for the video.
+            if video_writer is not None and video_count % video_skip == 0:
+                frame = env.render(mode="rgb_array", height=512, width=512)
+                video_frames.append(frame)
+            video_count += 1
+
+            task_success = success["task"]
+            all_done = task_success.all() if isinstance(task_success, torch.Tensor) else np.all(task_success)
+            if terminate_on_success and all_done:
+                end_step = step_i
+                break
+
+    except env.rollout_exceptions as e:
+        print("WARNING: got rollout exception {}".format(e))
+
+    if video_writer is not None:
+        for frame in video_frames:
+            video_writer.append_data(frame)
+
+    if end_step is None:
+        end_step = step_i
+
+    results_list = []
+    for i in range(num_envs):
+        total_reward = sum(_scalar(r, i) for r in rews[:end_step + 1])
+        result = dict(
+            Return=total_reward,
+            Horizon=end_step + 1,
+            Success_Rate=_scalar(success["task"], i),
+        )
+        for k in success:
+            if k != "task":
+                result["{}_Success_Rate".format(k)] = _scalar(success[k], i)
+        results_list.append(result)
+
+    return results_list
+
+
 def rollout_with_stats(
         policy,
         envs,
@@ -471,32 +598,51 @@ def rollout_with_stats(
         print("rollout: env={}, horizon={}, use_goals={}, num_episodes={}".format(
             env_name, horizon, use_goals, num_episodes,
         ))
-        rollout_logs = []
-        iterator = range(num_episodes)
-        if not verbose:
-            iterator = LogUtils.custom_tqdm(iterator, total=num_episodes)
 
-        num_success = 0
-        for ep_i in iterator:
+        if getattr(policy, "use_warp", False):
+            # Single parallelized rollout: one step sequence across num_envs simultaneous worlds.
+            # Video is captured from env 0 only.
             rollout_timestamp = time.time()
-            rollout_info = run_rollout(
+            rollout_logs = run_warp_rollout(
                 policy=policy,
                 env=env,
                 horizon=horizon,
-                render=render,
                 use_goals=use_goals,
+                terminate_on_success=terminate_on_success,
                 video_writer=env_video_writer,
                 video_skip=video_skip,
-                terminate_on_success=terminate_on_success,
             )
-            rollout_info["time"] = time.time() - rollout_timestamp
+            elapsed = time.time() - rollout_timestamp
+            per_env_time = elapsed / max(len(rollout_logs), 1)
+            for log in rollout_logs:
+                log["time"] = per_env_time
+        else:
+            rollout_logs = []
+            iterator = range(num_episodes)
+            if not verbose:
+                iterator = LogUtils.custom_tqdm(iterator, total=num_episodes)
 
-            rollout_logs.append(rollout_info)
-            num_success += rollout_info["Success_Rate"]
-            
-            if verbose:
-                print("Episode {}, horizon={}, num_success={}".format(ep_i + 1, horizon, num_success))
-                print(json.dumps(rollout_info, sort_keys=True, indent=4))
+            num_success = 0
+            for ep_i in iterator:
+                rollout_timestamp = time.time()
+                rollout_info = run_rollout(
+                    policy=policy,
+                    env=env,
+                    horizon=horizon,
+                    render=render,
+                    use_goals=use_goals,
+                    video_writer=env_video_writer,
+                    video_skip=video_skip,
+                    terminate_on_success=terminate_on_success,
+                )
+                rollout_info["time"] = time.time() - rollout_timestamp
+
+                rollout_logs.append(rollout_info)
+                num_success += rollout_info["Success_Rate"]
+
+                if verbose:
+                    print("Episode {}, horizon={}, num_success={}".format(ep_i + 1, horizon, num_success))
+                    print(json.dumps(rollout_info, sort_keys=True, indent=4))
 
         if video_dir is not None:
             # close this env's video writer (next env has it's own)
@@ -511,6 +657,10 @@ def rollout_with_stats(
     if video_path is not None:
         # close video writer that was used for all envs
         video_writer.close()
+    elif video_dir is not None:
+        # close per-env writers
+        for vw in video_writers.values():
+            vw.close()
 
     return all_rollout_logs, video_paths
 
