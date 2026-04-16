@@ -58,14 +58,20 @@ class DataLogger(object):
         if log_wandb:
             import wandb
             import robomimic.macros as Macros
-            
-            # set up wandb api key if specified in macros
-            if Macros.WANDB_API_KEY is not None:
+
+            # set up wandb api key if specified in macros (env var takes precedence)
+            if Macros.WANDB_API_KEY is not None and "WANDB_API_KEY" not in os.environ:
                 os.environ["WANDB_API_KEY"] = Macros.WANDB_API_KEY
 
-            assert Macros.WANDB_ENTITY is not None, "WANDB_ENTITY macro is set to None." \
-                    "\nSet this macro in {base_path}/macros_private.py" \
-                    "\nIf this file does not exist, first run python {base_path}/scripts/setup_macros.py".format(base_path=robomimic.__path__[0])
+            # resolve entity: env var (WANDB_ENTITY) > robomimic macro
+            wandb_entity = os.environ.get("WANDB_ENTITY") or Macros.WANDB_ENTITY
+            assert wandb_entity is not None, (
+                "wandb entity is not set. Either export WANDB_ENTITY (e.g. via .env.wandb) "
+                "or set WANDB_ENTITY in {base_path}/macros_private.py (run "
+                "python {base_path}/scripts/setup_macros.py to create it).".format(
+                    base_path=robomimic.__path__[0]
+                )
+            )
             
             # attempt to set up wandb 10 times. If unsuccessful after these trials, don't use wandb
             num_attempts = 10
@@ -74,10 +80,17 @@ class DataLogger(object):
                     # set up wandb
                     self._wandb_logger = wandb
 
+                    # optional wandb group (e.g. dataset variant like "d0")
+                    wandb_group = getattr(config.experiment.logging, "wandb_group", None)
+
+                    # run name is the date+time of the run (e.g. 2026-04-15_22-40-51)
+                    run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
                     self._wandb_logger.init(
-                        entity=Macros.WANDB_ENTITY,
+                        entity=wandb_entity,
                         project=config.experiment.logging.wandb_proj_name,
-                        name=config.experiment.name,
+                        name=run_name,
+                        group=wandb_group,
                         dir=log_dir,
                         mode=("offline" if attempt == num_attempts - 1 else "online"),
                     )
@@ -88,6 +101,13 @@ class DataLogger(object):
                         wandb_config[k] = v
                     if "algo" not in wandb_config:
                         wandb_config["algo"] = config.algo_name
+                    # Include the full training config so every hyperparameter
+                    # (algo, train, experiment, observation, …) shows up in the
+                    # wandb run's Config panel.
+                    try:
+                        wandb_config["config"] = config.to_dict()
+                    except Exception as e:
+                        log_warning("failed to serialize config for wandb: {}".format(e))
                     self._wandb_logger.config.update(wandb_config)
 
                     break
@@ -143,6 +163,43 @@ class DataLogger(object):
                     self._wandb_logger.log({k: wandb.Image(v)}, step=epoch)
             except Exception as e:
                 log_warning("wandb logging: {}".format(e))
+
+    def log_checkpoint(self, ckpt_path):
+        """
+        Upload a checkpoint file to wandb as a run artifact (no-op if wandb is
+        disabled or the file is missing).
+
+        Args:
+            ckpt_path (str): path to checkpoint file on disk
+        """
+        if self._wandb_logger is None:
+            return
+        if not ckpt_path or not os.path.isfile(ckpt_path):
+            return
+        try:
+            self._wandb_logger.save(ckpt_path, base_path=os.path.dirname(ckpt_path), policy="now")
+        except Exception as e:
+            log_warning("wandb checkpoint logging: {}".format(e))
+
+    def log_video(self, k, video_path, epoch, fps=20):
+        """
+        Upload a video file to wandb (no-op if wandb is disabled or the file is missing).
+
+        Args:
+            k (str): logging key (e.g. "Rollout/video/env_name")
+            video_path (str): path to video file on disk
+            epoch (int): step for wandb logging
+            fps (int): video frame rate for wandb player
+        """
+        if self._wandb_logger is None:
+            return
+        if not video_path or not os.path.isfile(video_path):
+            return
+        try:
+            import wandb
+            self._wandb_logger.log({k: wandb.Video(video_path, fps=fps, format="mp4")}, step=epoch)
+        except Exception as e:
+            log_warning("wandb video logging: {}".format(e))
 
     def get_stats(self, k):
         """

@@ -4,9 +4,12 @@ mainly consists of functions to assist with logging, rollouts, and the @run_epoc
 which is the core training logic for models in this repository.
 """
 import os
+import re
+import sys
 import time
 import datetime
-import shutil
+import threading
+import contextlib
 import json
 import h5py
 import imageio
@@ -50,7 +53,7 @@ def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
     """
     # timestamp for directory names
     t_now = time.time()
-    time_str = datetime.datetime.fromtimestamp(t_now).strftime('%Y%m%d%H%M%S')
+    time_str = datetime.datetime.fromtimestamp(t_now).strftime('%Y-%m-%d_%H-%M-%S')
 
     # create directory for where to dump model parameters, tensorboard logs, and videos
     base_output_dir = os.path.expanduser(config.train.output_dir)
@@ -63,14 +66,8 @@ def get_exp_dir(config, auto_remove_exp_dir=False, resume=False):
         subdir_lst = os.listdir(base_output_dir)
         time_str = sorted(subdir_lst)[-1]  # get the most recent subdirectory
         assert os.path.isdir(os.path.join(base_output_dir, time_str)), "Found item {} that is not a subdirectory in {}".format(time_str, base_output_dir)
-    elif os.path.exists(base_output_dir):
-        if not auto_remove_exp_dir:
-            ans = input("WARNING: model directory ({}) already exists! \noverwrite? (y/n)\n".format(base_output_dir))
-        else:
-            ans = "y"
-        if ans == "y":
-            print("REMOVING")
-            shutil.rmtree(base_output_dir)
+    # Each run gets its own timestamped subdirectory under base_output_dir, so
+    # it's safe (and desirable) to keep previous runs around for comparison.
 
     # only make model directory if model saving is enabled
     output_dir = None
@@ -387,6 +384,92 @@ def run_rollout(
     return results
 
 
+# Counters incremented by the physics-explosion guard in run_warp_rollout.
+# Useful for stability benchmarking — reset to 0 before a rollout and read after.
+WARP_EXPLOSION_STEPS = 0   # number of rollout steps that tripped the NaN/inf guard
+WARP_EXPLOSION_ENVS = 0    # cumulative (env, step) pairs with NaN/inf observations
+
+
+# mujoco-warp kernel-side warnings we don't want flooding stdout during rollouts.
+# These come from `wp.printf` inside Warp CUDA kernels, so Python-level stdout
+# redirection doesn't catch them — filtering happens at the OS file-descriptor
+# level in `_suppress_warp_kernel_warnings`.
+_WARP_KERNEL_WARNING_PATTERNS = (
+    re.compile(r"Warning: opt\.ccd_iterations, currently set to \d+, needs to be increased\."),
+    re.compile(r"broadphase overflow - please increase nconmax"),
+    re.compile(r"narrowphase overflow - please increase nconmax"),
+    re.compile(r"nefc overflow - please increase njmax"),
+    re.compile(r"CCD overflow - please increase naccdmax"),
+    re.compile(r"contact match overflow: please increase"),
+)
+
+
+@contextlib.contextmanager
+def _suppress_warp_kernel_warnings():
+    """
+    Redirect stdout at the FD level and drop lines matching known mujoco-warp
+    kernel-printf warnings. Other stdout content is passed through untouched.
+    Falls through as a no-op if the redirect can't be set up (non-POSIX, etc.).
+    """
+    try:
+        saved_fd = os.dup(1)                     # backup of original stdout
+        pump_fd = os.dup(saved_fd)               # independent FD for the pump thread
+        r_fd, w_fd = os.pipe()
+    except (OSError, AttributeError):
+        yield
+        return
+
+    def _pump():
+        # tqdm uses '\r' to redraw progress bars, so we split on both '\r' and
+        # '\n' and filter each chunk independently; otherwise a progress bar
+        # chunk can carry a trailing kernel warning past the filter.
+        with os.fdopen(r_fd, "rb", buffering=0) as reader, \
+                os.fdopen(pump_fd, "wb", buffering=0) as writer:
+            buf = b""
+            while True:
+                chunk = reader.read(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                parts = re.split(b"([\r\n])", buf)
+                buf = parts.pop() if parts and parts[-1] not in (b"\r", b"\n") else b""
+                out = bytearray()
+                segment = b""
+                for part in parts:
+                    if part in (b"\r", b"\n"):
+                        text = segment.decode("utf-8", errors="replace")
+                        if not any(p.search(text) for p in _WARP_KERNEL_WARNING_PATTERNS):
+                            out += segment + part
+                        segment = b""
+                    else:
+                        segment = part
+                if out:
+                    writer.write(bytes(out))
+            # flush any residual trailing text without a terminator
+            if buf:
+                text = buf.decode("utf-8", errors="replace")
+                if not any(p.search(text) for p in _WARP_KERNEL_WARNING_PATTERNS):
+                    writer.write(buf)
+
+    thread = threading.Thread(target=_pump, daemon=True)
+    thread.start()
+    try:
+        sys.stdout.flush()
+        os.dup2(w_fd, 1)                         # fd 1 now points at the pipe
+        os.close(w_fd)
+        yield
+    finally:
+        try:
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+        # Restore original stdout. Closing the last write-side of the pipe
+        # (the one at fd 1) sends EOF to the pump's reader so the thread exits.
+        os.dup2(saved_fd, 1)
+        os.close(saved_fd)
+        thread.join(timeout=2.0)
+
+
 def run_warp_rollout(
         policy,
         env,
@@ -446,50 +529,69 @@ def run_warp_rollout(
         except (TypeError, IndexError):
             return float(v)
 
+    # Track first explosion step for the post-rollout summary.
+    first_explosion_step = None
+    global WARP_EXPLOSION_STEPS, WARP_EXPLOSION_ENVS
+    start_steps = WARP_EXPLOSION_STEPS
+    start_envs = WARP_EXPLOSION_ENVS
+
     try:
-        for step_i in range(horizon):
-            # Physics-explosion guard: detect NaN/inf in any observation with a
-            # single GPU→CPU sync (cat all obs tensors, one .all() check).  Only do
-            # the per-key slow path when something is actually broken.
-            # Filter to tensors that share the same leading (batch) dimension to
-            # exclude RNN hidden states or other non-obs tensors with different shapes.
-            _obs_raw = [v for v in ob_dict.values() if isinstance(v, torch.Tensor) and v.dim() >= 1]
-            if _obs_raw:
-                _B = _obs_raw[0].shape[0]
-                _obs_tensors = [v.reshape(_B, -1) for v in _obs_raw if v.shape[0] == _B]
-            else:
-                _obs_tensors = []
-            if _obs_tensors and not torch.cat(_obs_tensors, dim=1).isfinite().all():
-                for k, v in ob_dict.items():
-                    if isinstance(v, torch.Tensor) and not v.isfinite().all():
-                        bad = (~v.isfinite().all(dim=-1) if v.dim() > 1 else ~v.isfinite()).nonzero(as_tuple=False).squeeze(-1)
-                        print(f"[warp] step {step_i}: physics explosion in obs '{k}' for envs {bad.tolist()[:5]} — zeroing")
-                        ob_dict[k] = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
-            ac = policy(ob=ob_dict, goal=goal_dict, batched_ob=True)
-            ob_dict, r, done, _ = env.step(ac)
-            rews.append(r)
+        with _suppress_warp_kernel_warnings():
+            for step_i in LogUtils.custom_tqdm(range(horizon), desc="warp rollout", total=horizon):
+                # Physics-explosion guard: detect NaN/inf in any observation with a
+                # single GPU→CPU sync (cat all obs tensors, one .all() check).  Only do
+                # the per-key slow path when something is actually broken.
+                # Filter to tensors that share the same leading (batch) dimension to
+                # exclude RNN hidden states or other non-obs tensors with different shapes.
+                _obs_raw = [v for v in ob_dict.values() if isinstance(v, torch.Tensor) and v.dim() >= 1]
+                if _obs_raw:
+                    _B = _obs_raw[0].shape[0]
+                    _obs_tensors = [v.reshape(_B, -1) for v in _obs_raw if v.shape[0] == _B]
+                else:
+                    _obs_tensors = []
+                if _obs_tensors and not torch.cat(_obs_tensors, dim=1).isfinite().all():
+                    WARP_EXPLOSION_STEPS += 1
+                    if first_explosion_step is None:
+                        first_explosion_step = step_i
+                    for k, v in ob_dict.items():
+                        if isinstance(v, torch.Tensor) and not v.isfinite().all():
+                            bad = (~v.isfinite().all(dim=-1) if v.dim() > 1 else ~v.isfinite()).nonzero(as_tuple=False).squeeze(-1)
+                            WARP_EXPLOSION_ENVS += bad.numel()
+                            ob_dict[k] = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+                ac = policy(ob=ob_dict, goal=goal_dict, batched_ob=True)
+                ob_dict, r, done, _ = env.step(ac)
+                rews.append(r)
 
-            cur_success_metrics = env.is_success()
-            if success is None:
-                success = deepcopy(cur_success_metrics)
-            else:
-                for k in success:
-                    success[k] = success[k] | cur_success_metrics[k]
+                cur_success_metrics = env.is_success()
+                if success is None:
+                    success = deepcopy(cur_success_metrics)
+                else:
+                    for k in success:
+                        success[k] = success[k] | cur_success_metrics[k]
 
-            # Capture a frame from env 0 for the video.
-            if video_writer is not None and video_count % video_skip == 0:
-                frame = env.render(mode="rgb_array", height=512, width=512)
-                video_frames.append(frame)
-            video_count += 1
+                # Capture a frame from env 0 for the video.
+                if video_writer is not None and video_count % video_skip == 0:
+                    frame = env.render(mode="rgb_array", height=512, width=512)
+                    video_frames.append(frame)
+                video_count += 1
 
-            task_success = success["task"]
-            all_done = task_success.all() if isinstance(task_success, torch.Tensor) else np.all(task_success)
-            if terminate_on_success and all_done:
-                end_step = step_i
-                break
+                task_success = success["task"]
+                all_done = task_success.all() if isinstance(task_success, torch.Tensor) else np.all(task_success)
+                if terminate_on_success and all_done:
+                    end_step = step_i
+                    break
 
     except env.rollout_exceptions as e:
         print("WARNING: got rollout exception {}".format(e))
+
+    # One-line summary instead of per-step spam.
+    delta_steps = WARP_EXPLOSION_STEPS - start_steps
+    delta_envs = WARP_EXPLOSION_ENVS - start_envs
+    if delta_steps > 0:
+        LogUtils.log_warning(
+            f"warp rollout: physics explosions detected on {delta_steps} steps "
+            f"(first at step {first_explosion_step}, {delta_envs} env-steps zeroed)"
+        )
 
     if video_writer is not None:
         for frame in video_frames:
@@ -651,7 +753,7 @@ def rollout_with_stats(
         # average metric across all episodes
         rollout_logs = dict((k, [rollout_logs[i][k] for i in range(len(rollout_logs))]) for k in rollout_logs[0])
         rollout_logs_mean = dict((k, np.mean(v)) for k, v in rollout_logs.items())
-        rollout_logs_mean["Time_Episode"] = np.sum(rollout_logs["time"]) / 60. # total time taken for rollouts in minutes
+        rollout_logs_mean["Time_Episode"] = float(np.sum(rollout_logs["time"]))  # total rollout wall time (s)
         all_rollout_logs[env_key] = rollout_logs_mean
 
     if video_path is not None:
@@ -713,7 +815,6 @@ def should_save_from_rollout_logs(
             best_return[env_name] = rollout_logs["Return"]
             if save_on_best_rollout_return:
                 # save checkpoint if achieve new best return
-                epoch_ckpt_name += "_{}_return_{}".format(env_name, best_return[env_name])
                 should_save_ckpt = True
                 ckpt_reason = "return"
 
@@ -721,7 +822,6 @@ def should_save_from_rollout_logs(
             best_success_rate[env_name] = rollout_logs["Success_Rate"]
             if save_on_best_rollout_success_rate:
                 # save checkpoint if achieve new best success rate
-                epoch_ckpt_name += "_{}_success_{}".format(env_name, best_success_rate[env_name])
                 should_save_ckpt = True
                 ckpt_reason = "success"
 
@@ -862,11 +962,10 @@ def run_epoch(model, data_loader, epoch, validate=False, num_steps=None, obs_nor
             step_log_dict[k].append(step_log_all[i][k])
     step_log_all = dict((k, float(np.mean(v))) for k, v in step_log_dict.items())
 
-    # add in timing stats
+    # add in timing stats (seconds)
     for k in timing_stats:
-        # sum across all training steps, and convert from seconds to minutes
-        step_log_all["Time_{}".format(k)] = np.sum(timing_stats[k]) / 60.
-    step_log_all["Time_Epoch"] = (time.time() - epoch_timestamp) / 60.
+        step_log_all["Time_{}".format(k)] = float(np.sum(timing_stats[k]))
+    step_log_all["Time_Epoch"] = time.time() - epoch_timestamp
 
     return step_log_all
 

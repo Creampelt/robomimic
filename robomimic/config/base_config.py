@@ -83,10 +83,12 @@ class BaseConfig(Config):
 
         self.experiment.name = "test"                               # name of experiment used to make log files
         self.experiment.validate = False                            # whether to do validation or not
-        self.experiment.logging.terminal_output_to_txt = True       # whether to log stdout to txt file 
+        self.experiment.logging.terminal_output_to_txt = True       # whether to log stdout to txt file
         self.experiment.logging.log_tb = True                       # enable tensorboard logging
         self.experiment.logging.log_wandb = False                   # enable wandb logging
         self.experiment.logging.wandb_proj_name = "debug"           # project name if using wandb
+        self.experiment.logging.wandb_group = None                  # optional wandb group (e.g. dataset variant like "d0")
+        self.experiment.logging.log_rollout_videos = True           # upload rollout videos to wandb (requires render_video=True and log_wandb=True)
                 
         ## save config - if and when to save model checkpoints ##
         self.experiment.save.enabled = True                         # whether model saving should be enabled or disabled

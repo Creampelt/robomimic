@@ -38,9 +38,62 @@ from robomimic.utils.log_utils import DataLogger, PrintLogger, flush_warnings
 from torch.utils.data import DataLoader
 
 
-def train(config, device, resume=False):
+def _perf_key(k, stage):
+    """Map a step_log ``Time_{X}`` key to ``Perf/{name}_time`` (or ``Perf/valid_{name}_time``).
+
+    Train stage keys are flat under Perf/; valid stage keys are prefixed with
+    ``valid_`` to keep them distinct. Rollout timing is logged as
+    ``Perf/rollout_time`` from a dedicated code path, not via this helper.
+    """
+    base = k[len("Time_"):].lower()
+    if base == "train_batch":
+        base = "batch"   # avoid redundant "train_batch" under the Train stage
+    if stage == "valid":
+        return "Perf/valid_{}_time".format(base)
+    return "Perf/{}_time".format(base)
+
+
+def _metric_key(k, stage):
+    """Normalize a step_log metric key to ``{stage}/{name}``."""
+    if k.startswith("Optimizer/") and k.endswith("_lr"):
+        tail = k[len("Optimizer/"):-len("_lr")]
+        if tail in ("", "policy0"):
+            return "{}/learning_rate".format(stage)
+        return "{}/learning_rate/{}".format(stage, tail.lower())
+    renames = {
+        "policy_grad_norms": "policy_grad_norm",
+    }
+    name = renames.get(k.lower(), k.lower())
+    return "{}/{}".format(stage, name)
+
+
+def _fetch_wandb_checkpoint(run_ref, model_name, download_dir):
+    """Download ``model_name`` from the wandb run at ``run_ref`` (entity/project/id).
+
+    Returns the local path of the downloaded file.
+    """
+    import wandb
+    api = wandb.Api()
+    run = api.run(run_ref)
+    os.makedirs(download_dir, exist_ok=True)
+    file_obj = run.file(model_name)
+    downloaded = file_obj.download(root=download_dir, replace=True)
+    # wandb returns an open file handle whose .name is the local path
+    return downloaded.name
+
+
+def train(config, device, resume=False, wandb_run=None, wandb_model=None):
     """
     Train a model using the algorithm.
+
+    Args:
+        config: robomimic Config
+        device: torch device
+        resume: if True, reload the latest checkpoint from the existing exp dir
+        wandb_run: optional ``entity/project/run_id`` to fetch a checkpoint from
+        wandb_model: optional checkpoint filename within that wandb run (e.g. ``model_50.pth``);
+            required when ``wandb_run`` is set. Starts training in a fresh timestamp dir
+            but loads weights + optimizer state + epoch counter from the downloaded file.
     """
 
     # first set seeds
@@ -249,7 +302,21 @@ def train(config, device, resume=False):
         device=device,
     )
 
-    if resume:
+    if wandb_run is not None:
+        assert wandb_model is not None, (
+            "--wandb_model is required when --wandb_run is given "
+            "(pick a checkpoint name like model_50.pth from the wandb run's files)"
+        )
+        assert not resume, "--resume and --wandb_run are mutually exclusive"
+        print("*" * 50)
+        print("fetching ckpt '{}' from wandb run {}".format(wandb_model, wandb_run))
+        wandb_ckpt_path = _fetch_wandb_checkpoint(wandb_run, wandb_model, time_dir)
+        print("downloaded to {}".format(wandb_ckpt_path))
+        ckpt_dict = FileUtils.load_dict_from_checkpoint(ckpt_path=wandb_ckpt_path)
+        model.deserialize(ckpt_dict["model"], load_optimizers=True)
+        resume = True  # reuse the existing resume variable_state handling below
+        print("*" * 50)
+    elif resume:
         # load ckpt dict
         print("*" * 50)
         print("resuming from ckpt at {}".format(latest_model_path))
@@ -295,6 +362,9 @@ def train(config, device, resume=False):
     best_return = {k: -np.inf for k in envs} if config.experiment.rollout.enabled else None
     best_success_rate = {k: -1.0 for k in envs} if config.experiment.rollout.enabled else None
     last_ckpt_time = time.time()
+    # accumulated wall time for the current stretch of training epochs; reset
+    # after each rollout so Perf/learn_time reports per-eval-interval cost.
+    learn_start_time = time.time()
 
     start_epoch = 1  # epoch numbers start at 1
     if resume:
@@ -321,7 +391,7 @@ def train(config, device, resume=False):
         model.on_epoch_end(epoch)
 
         # setup checkpoint path
-        epoch_ckpt_name = "model_epoch_{}".format(epoch)
+        epoch_ckpt_name = "model_{}".format(epoch)
 
         # check for recurring checkpoint saving conditions
         should_save_ckpt = False
@@ -345,9 +415,9 @@ def train(config, device, resume=False):
         print(json.dumps(step_log, sort_keys=True, indent=4))
         for k, v in step_log.items():
             if k.startswith("Time_"):
-                data_logger.record("Timing_Stats/Train_{}".format(k[5:]), v, epoch)
+                data_logger.record(_perf_key(k, "train"), v, epoch)
             else:
-                data_logger.record("Train/{}".format(k), v, epoch)
+                data_logger.record(_metric_key(k, "Train"), v, epoch)
 
         # Evaluate the model on validation set
         if config.experiment.validate:
@@ -362,9 +432,9 @@ def train(config, device, resume=False):
                 )
             for k, v in step_log.items():
                 if k.startswith("Time_"):
-                    data_logger.record("Timing_Stats/Valid_{}".format(k[5:]), v, epoch)
+                    data_logger.record(_perf_key(k, "valid"), v, epoch)
                 else:
-                    data_logger.record("Valid/{}".format(k), v, epoch)
+                    data_logger.record(_metric_key(k, "Valid"), v, epoch)
 
             print("Validation Epoch {}".format(epoch))
             print(json.dumps(step_log, sort_keys=True, indent=4))
@@ -374,7 +444,6 @@ def train(config, device, resume=False):
             if valid_check and (best_valid_loss is None or (step_log["Loss"] <= best_valid_loss)):
                 best_valid_loss = step_log["Loss"]
                 if config.experiment.save.enabled and config.experiment.save.on_best_validation:
-                    epoch_ckpt_name += "_best_validation_{}".format(best_valid_loss)
                     should_save_ckpt = True
                     ckpt_reason = "valid" if ckpt_reason is None else ckpt_reason
 
@@ -384,6 +453,9 @@ def train(config, device, resume=False):
         video_paths = None
         rollout_check = (epoch % config.experiment.rollout.rate == 0) or (should_save_ckpt and ckpt_reason == "time")
         if config.experiment.rollout.enabled and (epoch > config.experiment.rollout.warmstart) and rollout_check:
+            # log cumulative learn wall time since last rollout (seconds)
+            data_logger.record("Perf/learn_time", time.time() - learn_start_time, epoch)
+
             # wrap model as a RolloutPolicy to prepare for rollouts
             rollout_model = RolloutPolicy(
                 model,
@@ -407,17 +479,38 @@ def train(config, device, resume=False):
             )
 
             # summarize results from rollouts to tensorboard and terminal
+            # Keys are logged without env_name so multiple variants (d0/d1/d2) overlay
+            # on the same plot in wandb, and only the mean is recorded.
+            rollout_key_map = {
+                "Return": "Rollout/mean_reward",
+                "Success_Rate": "Rollout/success_rate",
+                "time": "Rollout/mean_time",
+            }
             for env_name in all_rollout_logs:
                 rollout_logs = all_rollout_logs[env_name]
                 for k, v in rollout_logs.items():
-                    if k.startswith("Time_"):
-                        data_logger.record("Timing_Stats/Rollout_{}_{}".format(env_name, k[5:]), v, epoch)
-                    else:
-                        data_logger.record("Rollout/{}/{}".format(k, env_name), v, epoch, log_stats=True)
+                    if k == "Horizon":
+                        continue
+                    if k in rollout_key_map:
+                        data_logger.record(rollout_key_map[k], v, epoch)
+                    elif k.endswith("_Success_Rate"):
+                        data_logger.record("Rollout/{}".format(k.lower()), v, epoch)
+                    elif k == "Time_Episode":
+                        # minutes spent in the rollout for this epoch
+                        data_logger.record("Perf/rollout_time", v, epoch)
 
                 print("\nEpoch {} Rollouts took {}s (avg) with results:".format(epoch, rollout_logs["time"]))
                 print("Env: {}".format(env_name))
                 print(json.dumps(rollout_logs, sort_keys=True, indent=4))
+
+            # upload rollout videos to wandb (no-op if wandb disabled or flag off)
+            if (
+                video_paths is not None
+                and config.experiment.logging.log_wandb
+                and config.experiment.logging.get("log_rollout_videos", True)
+            ):
+                for env_name, video_path in video_paths.items():
+                    data_logger.log_video("video", video_path, epoch)
 
             # checkpoint and video saving logic
             updated_stats = TrainUtils.should_save_from_rollout_logs(
@@ -437,6 +530,9 @@ def train(config, device, resume=False):
             if updated_stats["ckpt_reason"] is not None:
                 ckpt_reason = updated_stats["ckpt_reason"]
 
+            # reset learn-time accumulator for the next training stretch
+            learn_start_time = time.time()
+
         # get variable state for saving model
         variable_state = dict(
             epoch=epoch,
@@ -447,16 +543,19 @@ def train(config, device, resume=False):
 
         # Save model checkpoints based on conditions (success rate, validation loss, etc)
         if should_save_ckpt:
+            epoch_ckpt_path = os.path.join(ckpt_dir, epoch_ckpt_name + ".pth")
             TrainUtils.save_model(
                 model=model,
                 config=config,
                 env_meta=env_meta_list[0] if len(env_meta_list) == 1 else env_meta_list,
                 shape_meta=shape_meta_list[0] if len(shape_meta_list) == 1 else shape_meta_list,
                 variable_state=variable_state,
-                ckpt_path=os.path.join(ckpt_dir, epoch_ckpt_name + ".pth"),
+                ckpt_path=epoch_ckpt_path,
                 obs_normalization_stats=obs_normalization_stats,
                 action_normalization_stats=action_normalization_stats,
             )
+            if config.experiment.logging.log_wandb:
+                data_logger.log_checkpoint(epoch_ckpt_path)
 
         # always save latest model for resume functionality
         print("\nsaving latest model at {}...\n".format(latest_model_path))
@@ -531,7 +630,13 @@ def main(args):
     # catch error during training and print it
     res_str = "finished run successfully!"
     try:
-        train(config, device=device, resume=args.resume)
+        train(
+            config,
+            device=device,
+            resume=args.resume,
+            wandb_run=args.wandb_run,
+            wandb_model=args.wandb_model,
+        )
     except Exception as e:
         res_str = "run failed with error:\n{}\n\n{}".format(e, traceback.format_exc())
     print(res_str)
@@ -582,6 +687,22 @@ if __name__ == "__main__":
         "--resume",
         action="store_true",
         help="set this flag to resume training from latest checkpoint",
+    )
+
+    # resume training from a wandb-logged checkpoint
+    parser.add_argument(
+        "--wandb_run",
+        type=str,
+        default=None,
+        help="(optional) wandb run reference 'entity/project/run_id' to fetch a checkpoint from. "
+             "Requires --wandb_model. Training continues in a fresh timestamp dir, but weights, "
+             "optimizer state, and epoch counter are loaded from the downloaded checkpoint.",
+    )
+    parser.add_argument(
+        "--wandb_model",
+        type=str,
+        default=None,
+        help="(optional) checkpoint filename within the --wandb_run to download (e.g. 'model_50.pth').",
     )
 
     args = parser.parse_args()
