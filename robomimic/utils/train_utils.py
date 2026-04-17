@@ -393,7 +393,7 @@ WARP_EXPLOSION_ENVS = 0    # cumulative (env, step) pairs with NaN/inf observati
 # mujoco-warp kernel-side warnings we don't want flooding stdout during rollouts.
 # These come from `wp.printf` inside Warp CUDA kernels, so Python-level stdout
 # redirection doesn't catch them — filtering happens at the OS file-descriptor
-# level in `_suppress_warp_kernel_warnings`.
+# level in `suppress_warp_kernel_warnings`.
 _WARP_KERNEL_WARNING_PATTERNS = (
     re.compile(r"Warning: opt\.ccd_iterations, currently set to \d+, needs to be increased\."),
     re.compile(r"broadphase overflow - please increase nconmax"),
@@ -405,7 +405,7 @@ _WARP_KERNEL_WARNING_PATTERNS = (
 
 
 @contextlib.contextmanager
-def _suppress_warp_kernel_warnings():
+def suppress_warp_kernel_warnings():
     """
     Redirect stdout at the FD level and drop lines matching known mujoco-warp
     kernel-printf warnings. Other stdout content is passed through untouched.
@@ -536,7 +536,7 @@ def run_warp_rollout(
     start_envs = WARP_EXPLOSION_ENVS
 
     try:
-        with _suppress_warp_kernel_warnings():
+        with suppress_warp_kernel_warnings():
             for step_i in LogUtils.custom_tqdm(range(horizon), desc="warp rollout", total=horizon):
                 # Physics-explosion guard: detect NaN/inf in any observation with a
                 # single GPU→CPU sync (cat all obs tensors, one .all() check).  Only do
