@@ -50,6 +50,13 @@ class DataLogger(object):
         self._tb_logger = None
         self._wandb_logger = None
         self._data = dict() # store all the scalar data logged so far
+        # When True, use a user-logged ``local_step`` key as the wandb x-axis
+        # (via ``define_metric``) instead of wandb's implicit monotonic step.
+        # Required by the async rollout path, which needs to log rollout
+        # results at past epochs after more training has already logged.
+        self._use_local_step = bool(
+            getattr(config.experiment.logging, "use_local_step", False)
+        )
 
         if log_tb:
             from tensorboardX import SummaryWriter
@@ -110,6 +117,17 @@ class DataLogger(object):
                         log_warning("failed to serialize config for wandb: {}".format(e))
                     self._wandb_logger.config.update(wandb_config)
 
+                    if self._use_local_step:
+                        # Make every metric plot against ``local_step`` in
+                        # the wandb UI. Wandb's internal step keeps
+                        # incrementing monotonically on every ``log`` call
+                        # (we stop passing ``step=``), but plots read
+                        # ``local_step`` which may go backwards — needed
+                        # for async rollout results logged after later
+                        # training epochs.
+                        self._wandb_logger.define_metric("local_step")
+                        self._wandb_logger.define_metric("*", step_metric="local_step")
+
                     break
                 except Exception as e:
                     log_warning("wandb initialization error (attempt #{}): {}".format(attempt + 1, e))
@@ -153,14 +171,14 @@ class DataLogger(object):
         if self._wandb_logger is not None:
             try:
                 if data_type == 'scalar':
-                    self._wandb_logger.log({k: v}, step=epoch)
+                    self._wandb_log({k: v}, epoch)
                     if log_stats:
                         stats = self.get_stats(k)
                         for (stat_k, stat_v) in stats.items():
-                            self._wandb_logger.log({"{}/{}".format(k, stat_k): stat_v}, step=epoch)
+                            self._wandb_log({"{}/{}".format(k, stat_k): stat_v}, epoch)
                 elif data_type == 'image':
                     import wandb
-                    self._wandb_logger.log({k: wandb.Image(v)}, step=epoch)
+                    self._wandb_log({k: wandb.Image(v)}, epoch)
             except Exception as e:
                 log_warning("wandb logging: {}".format(e))
 
@@ -197,9 +215,27 @@ class DataLogger(object):
             return
         try:
             import wandb
-            self._wandb_logger.log({k: wandb.Video(video_path, fps=fps, format="mp4")}, step=epoch)
+            self._wandb_log({k: wandb.Video(video_path, fps=fps, format="mp4")}, epoch)
         except Exception as e:
             log_warning("wandb video logging: {}".format(e))
+
+    def _wandb_log(self, payload: dict, epoch: int) -> None:
+        """Wandb ``log`` helper that either uses wandb's implicit step or
+        a user-provided ``local_step`` key, depending on config.
+
+        In local-step mode, ``epoch`` may be less than a previously
+        logged one (e.g. a rollout for epoch 50 arriving while training
+        is on epoch 80). Wandb disallows going backwards in its internal
+        step, so we log without ``step=`` and let wandb auto-increment,
+        then rely on ``define_metric(step_metric='local_step')`` set at
+        init to get the correct plot x-axis.
+        """
+        if self._use_local_step:
+            payload = dict(payload)
+            payload["local_step"] = epoch
+            self._wandb_logger.log(payload)
+        else:
+            self._wandb_logger.log(payload, step=epoch)
 
     def get_stats(self, k):
         """

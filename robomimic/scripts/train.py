@@ -34,7 +34,8 @@ import robomimic.utils.train_utils as TrainUtils
 import torch
 from robomimic.algo import RolloutPolicy, algo_factory
 from robomimic.config import config_factory
-from robomimic.utils.log_utils import DataLogger, PrintLogger, flush_warnings
+from robomimic.utils.async_rollout import AsyncRolloutManager
+from robomimic.utils.log_utils import DataLogger, PrintLogger, flush_warnings, log_warning
 from torch.utils.data import DataLoader
 
 
@@ -65,6 +66,180 @@ def _metric_key(k, stage):
     }
     name = renames.get(k.lower(), k.lower())
     return "{}/{}".format(stage, name)
+
+
+def _consume_async_rollout_result(
+    *,
+    result,
+    data_logger,
+    config,
+    ckpt_dir: str,
+    env_meta_list,
+    shape_meta_list,
+    best_valid_loss,
+    best_return,
+    best_success_rate,
+    obs_normalization_stats,
+    action_normalization_stats,
+):
+    """Log one drained rollout and, if it's a new best, save the exact
+    snapshot weights — not the current live model, which may have moved
+    on since the rollout was submitted. ``best_return`` / ``best_success_rate``
+    are dicts mutated in place by the underlying tracker.
+    """
+    if result.error is not None:
+        log_warning(
+            "async rollout for epoch {} failed: {}".format(result.epoch, result.error)
+        )
+        return
+
+    # Use the rollout's epoch in the filename so the saved checkpoint is
+    # named after the weights it contains, not the training epoch we
+    # happen to be on when the result lands.
+    per_result_ckpt_name = "model_epoch_{}".format(result.epoch)
+
+    updated_stats = _log_rollout_result(
+        data_logger=data_logger,
+        config=config,
+        epoch_for_log=result.epoch,
+        all_rollout_logs=result.all_rollout_logs,
+        video_paths=result.video_paths,
+        best_return=best_return,
+        best_success_rate=best_success_rate,
+        epoch_ckpt_name=per_result_ckpt_name,
+    )
+
+    save_rollout_best = (
+        config.experiment.save.enabled
+        and updated_stats["should_save_ckpt"]
+        and updated_stats["ckpt_reason"] in ("return", "success")
+        and result.nets_state_dict is not None
+    )
+    if not save_rollout_best:
+        return
+
+    snapshot_ckpt_path = os.path.join(ckpt_dir, updated_stats["epoch_ckpt_name"] + ".pth")
+    variable_state_snapshot = dict(
+        epoch=result.epoch,
+        best_valid_loss=best_valid_loss,
+        best_return=best_return,
+        best_success_rate=best_success_rate,
+    )
+    _save_model_from_state_dict(
+        nets_state_dict=result.nets_state_dict,
+        config=config,
+        env_meta=env_meta_list[0] if len(env_meta_list) == 1 else env_meta_list,
+        shape_meta=shape_meta_list[0] if len(shape_meta_list) == 1 else shape_meta_list,
+        ckpt_path=snapshot_ckpt_path,
+        variable_state=variable_state_snapshot,
+        obs_normalization_stats=obs_normalization_stats,
+        action_normalization_stats=action_normalization_stats,
+    )
+    if config.experiment.logging.log_wandb:
+        data_logger.log_checkpoint(snapshot_ckpt_path)
+
+
+def _save_model_from_state_dict(
+    *,
+    nets_state_dict: dict,
+    config,
+    env_meta,
+    shape_meta,
+    ckpt_path: str,
+    variable_state: dict,
+    obs_normalization_stats=None,
+    action_normalization_stats=None,
+):
+    """Write an Algo-compatible checkpoint from a raw ``nets`` state_dict.
+
+    Used by the async rollout path to save the exact weights that scored
+    a new best, even after the main model has continued training.
+    Optimizer and lr_scheduler state are left empty — these checkpoints
+    are for publishing eval weights, not resuming training.
+    """
+    from copy import deepcopy
+
+    import robomimic.utils.tensor_utils as TensorUtils
+
+    env_meta = deepcopy(env_meta)
+    shape_meta = deepcopy(shape_meta)
+    params = dict(
+        model={"nets": nets_state_dict, "optimizers": {}, "lr_schedulers": {}},
+        config=config.dump(),
+        algo_name=config.algo_name,
+        env_metadata=env_meta,
+        shape_metadata=shape_meta,
+        variable_state=variable_state,
+    )
+    if obs_normalization_stats is not None:
+        assert config.train.hdf5_normalize_obs
+        params["obs_normalization_stats"] = TensorUtils.to_list(deepcopy(obs_normalization_stats))
+    if action_normalization_stats is not None:
+        params["action_normalization_stats"] = TensorUtils.to_list(deepcopy(action_normalization_stats))
+    torch.save(params, ckpt_path)
+    print("save (snapshot) checkpoint to {}".format(ckpt_path))
+
+
+def _log_rollout_result(
+    *,
+    data_logger,
+    config,
+    epoch_for_log: int,
+    all_rollout_logs: dict,
+    video_paths: dict | None,
+    best_return,
+    best_success_rate,
+    epoch_ckpt_name: str,
+):
+    """Consume one rollout result (sync or async) and log it to wandb/tb.
+
+    Mirrors the per-epoch logging block that used to live inline in the
+    train loop. Returns ``TrainUtils.should_save_from_rollout_logs``'s
+    updated stats so the caller can decide whether to checkpoint.
+
+    ``epoch_for_log`` is the epoch the *rollout* was for (may lag the
+    current training epoch when running async). Metrics and video are
+    recorded against this value — with ``use_local_step`` enabled, wandb
+    plots them at the correct x position even when the training side
+    has already logged later epochs.
+    """
+    rollout_key_map = {
+        "Return": "Rollout/mean_reward",
+        "Success_Rate": "Rollout/success_rate",
+        "time": "Rollout/mean_time",
+    }
+    for env_name, rollout_logs in all_rollout_logs.items():
+        for k, v in rollout_logs.items():
+            if k == "Horizon":
+                continue
+            if k in rollout_key_map:
+                data_logger.record(rollout_key_map[k], v, epoch_for_log)
+            elif k.endswith("_Success_Rate"):
+                data_logger.record("Rollout/{}".format(k.lower()), v, epoch_for_log)
+            elif k == "Time_Episode":
+                data_logger.record("Perf/rollout_time", v, epoch_for_log)
+
+        print("\nEpoch {} Rollouts took {}s (avg) with results:".format(
+            epoch_for_log, rollout_logs["time"]))
+        print("Env: {}".format(env_name))
+        print(json.dumps(rollout_logs, sort_keys=True, indent=4))
+
+    if (
+        video_paths is not None
+        and config.experiment.logging.log_wandb
+        and config.experiment.logging.get("log_rollout_videos", True)
+    ):
+        for _, video_path in video_paths.items():
+            data_logger.log_video("video", video_path, epoch_for_log)
+
+    return TrainUtils.should_save_from_rollout_logs(
+        all_rollout_logs=all_rollout_logs,
+        best_return=best_return,
+        best_success_rate=best_success_rate,
+        epoch_ckpt_name=epoch_ckpt_name,
+        save_on_best_rollout_return=config.experiment.save.on_best_rollout_return,
+        save_on_best_rollout_success_rate=config.experiment.save.on_best_rollout_success_rate,
+    )
 
 
 def _fetch_wandb_checkpoint(run_ref, model_name, download_dir):
@@ -288,6 +463,17 @@ def train(config, device, resume=False, wandb_run=None, wandb_model=None):
                     config.algo["value_planner"][sub_algo].optim_params[k]["num_epochs"] = config.train.num_epochs
 
     # setup for a new training run
+    # Async rollouts log past-epoch results, which fails against wandb's
+    # monotonic implicit step — auto-enable local_step before DataLogger
+    # does its one-shot wandb.define_metric.
+    if (
+        getattr(config.experiment.rollout, "async_enabled", False)
+        and config.experiment.logging.log_wandb
+        and not getattr(config.experiment.logging, "use_local_step", False)
+    ):
+        with config.values_unlocked():
+            config.experiment.logging.use_local_step = True
+        print("async rollouts enabled: auto-enabling logging.use_local_step for wandb")
     data_logger = DataLogger(
         log_dir,
         config,
@@ -365,6 +551,30 @@ def train(config, device, resume=False, wandb_run=None, wandb_model=None):
     # accumulated wall time for the current stretch of training epochs; reset
     # after each rollout so Perf/learn_time reports per-eval-interval cost.
     learn_start_time = time.time()
+
+    # Async rollout manager (optional). When enabled, the env pool is
+    # handed off to a background thread so training keeps making progress
+    # during evaluation rollouts. The main thread no longer calls
+    # ``rollout_with_stats`` directly; it submits snapshots and drains
+    # completed results.
+    async_rollout_enabled = bool(
+        config.experiment.rollout.enabled
+        and getattr(config.experiment.rollout, "async_enabled", False)
+    )
+    async_rollouts = None
+    if async_rollout_enabled:
+        async_rollouts = AsyncRolloutManager(
+            envs=envs,
+            model=model,
+            horizon=config.experiment.rollout.horizon,
+            num_episodes=config.experiment.rollout.n,
+            use_warp=config.experiment.rollout.use_warp,
+            use_goals=config.use_goals,
+            video_dir=video_dir if config.experiment.render_video else None,
+            video_skip=config.experiment.get("video_skip", 5),
+            terminate_on_success=config.experiment.rollout.terminate_on_success,
+            queue_size=getattr(config.experiment.rollout, "async_queue_size", 2),
+        )
 
     start_epoch = 1  # epoch numbers start at 1
     if resume:
@@ -450,76 +660,46 @@ def train(config, device, resume=False, wandb_run=None, wandb_model=None):
         # Evaluate the model by by running rollouts
 
         # do rollouts at fixed rate or if it's time to save a new ckpt
-        video_paths = None
         rollout_check = (epoch % config.experiment.rollout.rate == 0) or (should_save_ckpt and ckpt_reason == "time")
-        if config.experiment.rollout.enabled and (epoch > config.experiment.rollout.warmstart) and rollout_check:
+        fire_rollout = (
+            config.experiment.rollout.enabled
+            and (epoch > config.experiment.rollout.warmstart)
+            and rollout_check
+        )
+
+        if fire_rollout:
             # log cumulative learn wall time since last rollout (seconds)
             data_logger.record("Perf/learn_time", time.time() - learn_start_time, epoch)
 
-            # wrap model as a RolloutPolicy to prepare for rollouts
+        if fire_rollout and async_rollouts is None:
+            # Synchronous path (original behavior).
             rollout_model = RolloutPolicy(
                 model,
                 obs_normalization_stats=obs_normalization_stats,
                 action_normalization_stats=action_normalization_stats,
                 use_warp=config.experiment.rollout.use_warp,
             )
-
-            num_episodes = config.experiment.rollout.n
             all_rollout_logs, video_paths = TrainUtils.rollout_with_stats(
                 policy=rollout_model,
                 envs=envs,
                 horizon=config.experiment.rollout.horizon,
                 use_goals=config.use_goals,
-                num_episodes=num_episodes,
+                num_episodes=config.experiment.rollout.n,
                 render=False,
                 video_dir=video_dir if config.experiment.render_video else None,
                 epoch=epoch,
                 video_skip=config.experiment.get("video_skip", 5),
                 terminate_on_success=config.experiment.rollout.terminate_on_success,
             )
-
-            # summarize results from rollouts to tensorboard and terminal
-            # Keys are logged without env_name so multiple variants (d0/d1/d2) overlay
-            # on the same plot in wandb, and only the mean is recorded.
-            rollout_key_map = {
-                "Return": "Rollout/mean_reward",
-                "Success_Rate": "Rollout/success_rate",
-                "time": "Rollout/mean_time",
-            }
-            for env_name in all_rollout_logs:
-                rollout_logs = all_rollout_logs[env_name]
-                for k, v in rollout_logs.items():
-                    if k == "Horizon":
-                        continue
-                    if k in rollout_key_map:
-                        data_logger.record(rollout_key_map[k], v, epoch)
-                    elif k.endswith("_Success_Rate"):
-                        data_logger.record("Rollout/{}".format(k.lower()), v, epoch)
-                    elif k == "Time_Episode":
-                        # minutes spent in the rollout for this epoch
-                        data_logger.record("Perf/rollout_time", v, epoch)
-
-                print("\nEpoch {} Rollouts took {}s (avg) with results:".format(epoch, rollout_logs["time"]))
-                print("Env: {}".format(env_name))
-                print(json.dumps(rollout_logs, sort_keys=True, indent=4))
-
-            # upload rollout videos to wandb (no-op if wandb disabled or flag off)
-            if (
-                video_paths is not None
-                and config.experiment.logging.log_wandb
-                and config.experiment.logging.get("log_rollout_videos", True)
-            ):
-                for env_name, video_path in video_paths.items():
-                    data_logger.log_video("video", video_path, epoch)
-
-            # checkpoint and video saving logic
-            updated_stats = TrainUtils.should_save_from_rollout_logs(
+            updated_stats = _log_rollout_result(
+                data_logger=data_logger,
+                config=config,
+                epoch_for_log=epoch,
                 all_rollout_logs=all_rollout_logs,
+                video_paths=video_paths,
                 best_return=best_return,
                 best_success_rate=best_success_rate,
                 epoch_ckpt_name=epoch_ckpt_name,
-                save_on_best_rollout_return=config.experiment.save.on_best_rollout_return,
-                save_on_best_rollout_success_rate=config.experiment.save.on_best_rollout_success_rate,
             )
             best_return = updated_stats["best_return"]
             best_success_rate = updated_stats["best_success_rate"]
@@ -529,9 +709,40 @@ def train(config, device, resume=False, wandb_run=None, wandb_model=None):
             ) or should_save_ckpt
             if updated_stats["ckpt_reason"] is not None:
                 ckpt_reason = updated_stats["ckpt_reason"]
-
-            # reset learn-time accumulator for the next training stretch
             learn_start_time = time.time()
+        elif fire_rollout and async_rollouts is not None:
+            # Async path: queue a snapshot, don't block. Results come
+            # back on the next few iterations via drain() below.
+            async_rollouts.submit(
+                epoch=epoch,
+                model=model,
+                obs_normalization_stats=obs_normalization_stats,
+                action_normalization_stats=action_normalization_stats,
+            )
+            learn_start_time = time.time()
+
+        if async_rollouts is not None:
+            # Drain any rollouts that completed during training. Each
+            # result is logged at its own epoch via local_step so wandb
+            # plots them at the correct x-axis position. Rollout-best
+            # saves are handled inline with exact-weight snapshots —
+            # they do NOT propagate ``should_save_ckpt`` out to the
+            # outer save block (which would save the current, newer
+            # model under a past-epoch's best-score filename).
+            for result in async_rollouts.drain():
+                _consume_async_rollout_result(
+                    result=result,
+                    data_logger=data_logger,
+                    config=config,
+                    ckpt_dir=ckpt_dir,
+                    env_meta_list=env_meta_list,
+                    shape_meta_list=shape_meta_list,
+                    best_valid_loss=best_valid_loss,
+                    best_return=best_return,
+                    best_success_rate=best_success_rate,
+                    obs_normalization_stats=obs_normalization_stats,
+                    action_normalization_stats=action_normalization_stats,
+                )
 
         # get variable state for saving model
         variable_state = dict(
@@ -579,6 +790,28 @@ def train(config, device, resume=False, wandb_run=None, wandb_model=None):
         mem_usage = int(process.memory_info().rss / 1000000)
         data_logger.record("System/RAM Usage (MB)", mem_usage, epoch)
         print("\nEpoch {} Memory Usage: {} MB\n".format(epoch, mem_usage))
+
+    # Wait for any in-flight async rollouts to finish and log their
+    # results before wandb closes. Each result may still trigger a
+    # best-score snapshot checkpoint.
+    if async_rollouts is not None:
+        try:
+            for result in async_rollouts.drain_blocking(timeout=None):
+                _consume_async_rollout_result(
+                    result=result,
+                    data_logger=data_logger,
+                    config=config,
+                    ckpt_dir=ckpt_dir,
+                    env_meta_list=env_meta_list,
+                    shape_meta_list=shape_meta_list,
+                    best_valid_loss=best_valid_loss,
+                    best_return=best_return,
+                    best_success_rate=best_success_rate,
+                    obs_normalization_stats=obs_normalization_stats,
+                    action_normalization_stats=action_normalization_stats,
+                )
+        finally:
+            async_rollouts.close()
 
     # terminate logging
     data_logger.close()

@@ -89,6 +89,11 @@ class BaseConfig(Config):
         self.experiment.logging.wandb_proj_name = "debug"           # project name if using wandb
         self.experiment.logging.wandb_group = None                  # optional wandb group (e.g. dataset variant like "d0")
         self.experiment.logging.log_rollout_videos = True           # upload rollout videos to wandb (requires render_video=True and log_wandb=True)
+        # When True, use a user-logged ``local_step`` key as the wandb x-axis
+        # (instead of wandb's implicit monotonic step). Required when
+        # ``rollout.async_enabled`` is True so past-epoch rollout results
+        # can be logged after later training epochs.
+        self.experiment.logging.use_local_step = False
                 
         ## save config - if and when to save model checkpoints ##
         self.experiment.save.enabled = True                         # whether model saving should be enabled or disabled
@@ -126,6 +131,15 @@ class BaseConfig(Config):
         # (instead of numpy arrays), and actions are converted to warp GPU arrays before being
         # passed to the environment. Requires the environment to be instantiated with use_warp=True.
         self.experiment.rollout.use_warp = False
+
+        # Run evaluation rollouts on a background thread so training keeps
+        # making progress. Requires ``logging.use_local_step=True`` for
+        # wandb to plot past-epoch rollout results correctly.
+        self.experiment.rollout.async_enabled = False
+        # Max pending rollouts allowed before ``submit`` blocks. 2 lets one
+        # rollout run on the worker while the next is queued; increase
+        # only if training iters are much faster than a rollout.
+        self.experiment.rollout.async_queue_size = 2
 
         # for updating the evaluation env meta data
         self.experiment.env_meta_update_dict = Config()
